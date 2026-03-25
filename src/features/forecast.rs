@@ -286,4 +286,82 @@ mod tests {
         assert_eq!(parsed.entity_primary.as_deref(), Some("Robert Morris"));
         assert_eq!(parsed.entity_secondary.as_deref(), Some("Niagara Winner?"));
     }
+
+    #[test]
+    fn infers_weather_vertical_from_ticker() {
+        let parsed = parse_market_metadata(
+            "KXHIGH-NYC-26MAR25",
+            "Will the high temp exceed 60F?",
+            None,
+            None,
+        );
+        assert_eq!(parsed.vertical, "weather");
+    }
+
+    #[test]
+    fn infers_sports_vertical_from_ticker_nba() {
+        let parsed = parse_market_metadata("KXNBAGAME-123", "Game outcome", None, None);
+        assert_eq!(parsed.vertical, "sports");
+    }
+
+    #[test]
+    fn infers_crypto_vertical_from_ticker() {
+        let parsed = parse_market_metadata("KXBTC-26DEC-B120000", "Bitcoin above 120k", None, None);
+        assert_eq!(parsed.vertical, "crypto");
+    }
+
+    #[test]
+    fn infers_other_vertical_as_fallback() {
+        let parsed = parse_market_metadata("KXPOLITICS-001", "Will X happen?", None, None);
+        assert_eq!(parsed.vertical, "other");
+    }
+
+    #[test]
+    fn parses_threshold_direction_below() {
+        let parsed = parse_market_metadata(
+            "KXWEATHER",
+            "Will the temperature be below 32F?",
+            None,
+            Some(MarketVertical::Weather),
+        );
+        assert_eq!(parsed.threshold_direction.as_deref(), Some("below"));
+    }
+
+    #[test]
+    fn parses_threshold_direction_above_via_greater_than() {
+        let parsed = parse_market_metadata(
+            "KXTEST",
+            "Will X be greater than 100?",
+            None,
+            None,
+        );
+        assert_eq!(parsed.threshold_direction.as_deref(), Some("above"));
+    }
+
+    #[test]
+    fn no_threshold_when_no_number_in_title() {
+        let parsed = parse_market_metadata("KXTEST", "Will it rain tomorrow?", None, None);
+        assert!(parsed.threshold_value.is_none());
+    }
+
+    #[test]
+    fn subtitle_merged_for_entity_extraction() {
+        let parsed = parse_market_metadata(
+            "KXSPORTS",
+            "Team A vs Team B",
+            Some("in the final"),
+            Some(MarketVertical::Sports),
+        );
+        assert_eq!(parsed.entity_primary.as_deref(), Some("Team A"));
+        assert_eq!(parsed.entity_secondary.as_deref(), Some("Team B in the final"));
+    }
+
+    #[test]
+    fn market_mid_prob_yes_calculation() {
+        // bid=45, ask=55 → mid = (45+55)/2/100 = 0.50
+        use super::market_mid_prob_yes;
+        assert_eq!(market_mid_prob_yes(Some(45.0), Some(55.0)), Some(0.50));
+        assert_eq!(market_mid_prob_yes(None, Some(55.0)), None);
+        assert_eq!(market_mid_prob_yes(Some(45.0), None), None);
+    }
 }

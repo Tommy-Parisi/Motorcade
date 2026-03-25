@@ -456,6 +456,10 @@ async fn run_cycle(runtime: &BotRuntime) {
         })
         .collect();
 
+    // Collect forecast model fair prices to override heuristic valuations below.
+    let mut forecast_fair_prices: std::collections::HashMap<String, (f64, f64)> =
+        std::collections::HashMap::new();
+
     if let Some(model) = &runtime.forecast_model {
         let shadow_rows: Vec<_> = valuation_inputs
             .iter()
@@ -495,6 +499,25 @@ async fn run_cycle(runtime: &BotRuntime) {
                     .unwrap_or("unknown"),
                 shadow_rows.len()
             );
+        }
+        // Series prefixes where the forecast model override is suppressed because
+        // real-time external data (e.g. live price feed) makes the market correct by
+        // construction. Controlled by BOT_FORECAST_SERIES_EXCLUSIONS (comma-separated).
+        let forecast_exclusions: Vec<String> = std::env::var("BOT_FORECAST_SERIES_EXCLUSIONS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        for (feature, output) in &shadow_rows {
+            let excluded = forecast_exclusions.iter().any(|prefix| {
+                feature.ticker.starts_with(prefix.as_str())
+                    || feature.series_ticker.as_deref().unwrap_or("").starts_with(prefix.as_str())
+            });
+            if !excluded {
+                forecast_fair_prices.insert(feature.ticker.clone(), (output.fair_prob_yes, output.confidence));
+            }
         }
         let borrowed_rows: Vec<_> = shadow_rows.iter().map(|(feature, output)| (feature, output.clone())).collect();
         if let Err(err) = record_shadow_outputs(&runtime.forecast_runtime, &cycle_id, &borrowed_rows) {
@@ -670,6 +693,25 @@ async fn run_cycle(runtime: &BotRuntime) {
         }
     };
     println!("valued {} markets", valuations.len());
+
+    // Override heuristic fair prices with forecast model output when available.
+    let valuations = if forecast_fair_prices.is_empty() {
+        valuations
+    } else {
+        let overridden = valuations
+            .into_iter()
+            .map(|mut v| {
+                if let Some(&(fair, conf)) = forecast_fair_prices.get(&v.ticker) {
+                    v.fair_prob_yes = fair;
+                    v.confidence = conf;
+                    v.rationale = format!("forecast-model fair={:.4}", fair);
+                }
+                v
+            })
+            .collect();
+        overridden
+    };
+
     let valuation_summary = runtime.valuator.last_run_summary();
     let fallback_reason_text = if valuation_summary.fallback_reasons.is_empty() {
         "none".to_string()

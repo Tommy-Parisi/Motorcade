@@ -206,3 +206,148 @@ fn infer_execution_mode_from_report(report: &ExecutionReport) -> &'static str {
         detect_execution_mode()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::types::{OrderType, Side, TimeInForce};
+    use tempfile::TempDir;
+
+    fn temp_cfg(tmp: &TempDir) -> ResearchCaptureConfig {
+        ResearchCaptureConfig {
+            enabled: true,
+            root_dir: tmp.path().to_path_buf(),
+        }
+    }
+
+    fn make_order() -> OrderRequest {
+        OrderRequest {
+            client_order_id: "coid-001".to_string(),
+            market_id: "KXTEST-001".to_string(),
+            outcome_id: "yes".to_string(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(0.55),
+            quantity: 10.0,
+            time_in_force: TimeInForce::Gtc,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_signal() -> TradeSignal {
+        TradeSignal {
+            market_id: "KXTEST-001".to_string(),
+            outcome_id: "yes".to_string(),
+            side: Side::Buy,
+            fair_price: 0.65,
+            observed_price: 0.55,
+            edge_pct: 0.10,
+            confidence: 0.8,
+            signal_timestamp: Utc::now(),
+            signal_origin: Some("model_candidate".to_string()),
+        }
+    }
+
+    #[test]
+    fn record_order_intent_writes_valid_json() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = temp_cfg(&tmp);
+        let order = make_order();
+        let signal = make_signal();
+
+        record_order_intent(&cfg, &order, &signal).expect("should write without error");
+
+        // Find the written file
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp
+            .path()
+            .join("order_lifecycle")
+            .join(&day)
+            .join("order_lifecycle.jsonl");
+        assert!(path.exists(), "file should be created");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line = content.lines().next().expect("should have one line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("should be valid JSON");
+
+        assert_eq!(parsed["event_type"], "intent");
+        assert_eq!(parsed["client_order_id"], "coid-001");
+        assert_eq!(parsed["ticker"], "KXTEST-001");
+        assert_eq!(parsed["signal_fair_price"], 0.65);
+        assert_eq!(parsed["signal_edge_pct"], 0.10);
+    }
+
+    #[test]
+    fn record_order_error_writes_error_field() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = temp_cfg(&tmp);
+        let order = make_order();
+
+        record_order_error(&cfg, &order, "submit_error", "exchange rejected")
+            .expect("should write");
+
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp
+            .path()
+            .join("order_lifecycle")
+            .join(&day)
+            .join("order_lifecycle.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+
+        assert_eq!(parsed["event_type"], "submit_error");
+        assert_eq!(parsed["error"], "exchange rejected");
+    }
+
+    #[test]
+    fn disabled_cfg_skips_write() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = ResearchCaptureConfig {
+            enabled: false,
+            root_dir: tmp.path().to_path_buf(),
+        };
+        let order = make_order();
+        let signal = make_signal();
+
+        record_order_intent(&cfg, &order, &signal).expect("should be Ok even when disabled");
+
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp
+            .path()
+            .join("order_lifecycle")
+            .join(&day)
+            .join("order_lifecycle.jsonl");
+        assert!(!path.exists(), "no file should be created when disabled");
+    }
+
+    #[test]
+    fn infer_execution_mode_from_report_detects_paper_prefix() {
+        let report = ExecutionReport {
+            order_id: "paper-12345".to_string(),
+            client_order_id: "c1".to_string(),
+            status: OrderStatus::Filled,
+            submitted_time_in_force: None,
+            filled_qty: 10.0,
+            avg_fill_price: Some(0.55),
+            fee_paid: 0.0,
+            updated_at: Utc::now(),
+        };
+        assert_eq!(infer_execution_mode_from_report(&report), "paper");
+    }
+
+    #[test]
+    fn infer_execution_mode_from_report_detects_sim_prefix() {
+        let report = ExecutionReport {
+            order_id: "sim-99".to_string(),
+            client_order_id: "c2".to_string(),
+            status: OrderStatus::Canceled,
+            submitted_time_in_force: None,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            fee_paid: 0.0,
+            updated_at: Utc::now(),
+        };
+        assert_eq!(infer_execution_mode_from_report(&report), "paper");
+    }
+}

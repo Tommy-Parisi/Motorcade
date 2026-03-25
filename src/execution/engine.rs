@@ -157,13 +157,23 @@ impl ExecutionEngine {
         self.save_state(&state)?;
 
         let mut report = if self.mode == ExecutionMode::Paper {
+            // Simulate fill based on real market quote.
+            // observed_price is the ask for Buy orders (set by the valuation pipeline).
+            // IOC fills iff limit >= ask; fill price = ask, not limit.
+            let ask = signal.observed_price;
+            let limit = order.limit_price.unwrap_or(0.0);
+            let (status, filled_qty, avg_fill_price) = if limit >= ask {
+                (OrderStatus::Filled, order.quantity, Some(ask))
+            } else {
+                (OrderStatus::Canceled, 0.0, None)
+            };
             ExecutionReport {
                 order_id: format!("paper-{}", order.client_order_id),
                 client_order_id: order.client_order_id.clone(),
-                status: OrderStatus::Filled,
+                status,
                 submitted_time_in_force: Some(order.time_in_force),
-                filled_qty: order.quantity,
-                avg_fill_price: order.limit_price,
+                filled_qty,
+                avg_fill_price,
                 fee_paid: 0.0,
                 updated_at: Utc::now(),
             }

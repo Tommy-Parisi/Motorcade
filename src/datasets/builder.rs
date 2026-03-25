@@ -560,6 +560,149 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn split_name_boundary_values() {
+        // 10 rows: indices 0..9, split at 0.70 and 0.85
+        // index 0..6 (ratio < 0.70) → train
+        // index 7 (0.70 ≤ ratio < 0.85) → validation
+        // index 8..9 (ratio ≥ 0.85) → test
+        assert_eq!(split_name(0, 10), "train");
+        assert_eq!(split_name(6, 10), "train");  // 6/10 = 0.6 < 0.70
+        assert_eq!(split_name(7, 10), "validation"); // 7/10 = 0.70
+        assert_eq!(split_name(8, 10), "validation"); // 8/10 = 0.80
+        assert_eq!(split_name(9, 10), "test");   // 9/10 = 0.90 ≥ 0.85
+    }
+
+    #[test]
+    fn classify_execution_source_detects_bootstrap_synthetic() {
+        let intent = OrderLifecycleEvent {
+            schema_version: "v1".to_string(),
+            ts: Utc::now(),
+            client_order_id: "c1".to_string(),
+            order_id: None,
+            ticker: "KXTEST".to_string(),
+            outcome_id: "yes".to_string(),
+            side: crate::execution::types::Side::Buy,
+            tif: crate::execution::types::TimeInForce::Gtc,
+            limit_price: Some(0.5),
+            requested_qty: 10.0,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            fee_paid: None,
+            signal_fair_price: None,
+            signal_observed_price: None,
+            signal_edge_pct: None,
+            signal_confidence: None,
+            signal_origin: Some("bootstrap_synthetic".to_string()),
+            execution_mode: Some("paper".to_string()),
+            is_synthetic: false,
+            status: None,
+            event_type: "intent".to_string(),
+            error: None,
+        };
+        let result = classify_execution_source(&intent, &[intent.clone()], None);
+        assert_eq!(result, "bootstrap_synthetic");
+    }
+
+    #[test]
+    fn classify_execution_source_detects_organic_paper() {
+        let intent = OrderLifecycleEvent {
+            schema_version: "v1".to_string(),
+            ts: Utc::now(),
+            client_order_id: "c2".to_string(),
+            order_id: None,
+            ticker: "KXTEST".to_string(),
+            outcome_id: "yes".to_string(),
+            side: crate::execution::types::Side::Buy,
+            tif: crate::execution::types::TimeInForce::Gtc,
+            limit_price: Some(0.5),
+            requested_qty: 10.0,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            fee_paid: None,
+            signal_fair_price: None,
+            signal_observed_price: None,
+            signal_edge_pct: None,
+            signal_confidence: None,
+            signal_origin: Some("model_candidate".to_string()),
+            execution_mode: Some("paper".to_string()),
+            is_synthetic: false,
+            status: None,
+            event_type: "intent".to_string(),
+            error: None,
+        };
+        let result = classify_execution_source(&intent, &[intent.clone()], None);
+        assert_eq!(result, "organic_paper");
+    }
+
+    #[test]
+    fn classify_execution_source_detects_paper_from_order_id_prefix() {
+        let intent = OrderLifecycleEvent {
+            schema_version: "v1".to_string(),
+            ts: Utc::now(),
+            client_order_id: "c3".to_string(),
+            order_id: None,
+            ticker: "KXTEST".to_string(),
+            outcome_id: "yes".to_string(),
+            side: crate::execution::types::Side::Buy,
+            tif: crate::execution::types::TimeInForce::Gtc,
+            limit_price: Some(0.5),
+            requested_qty: 10.0,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            fee_paid: None,
+            signal_fair_price: None,
+            signal_observed_price: None,
+            signal_edge_pct: None,
+            signal_confidence: None,
+            signal_origin: None,
+            execution_mode: None,      // no execution_mode set
+            is_synthetic: false,
+            status: None,
+            event_type: "intent".to_string(),
+            error: None,
+        };
+        // Sibling event has order_id with paper- prefix
+        let ack = OrderLifecycleEvent {
+            order_id: Some("paper-abc123".to_string()),
+            event_type: "ack".to_string(),
+            ..intent.clone()
+        };
+        let result = classify_execution_source(&intent, &[intent.clone(), ack], None);
+        assert_eq!(result, "organic_paper");
+    }
+
+    #[test]
+    fn classify_execution_source_detects_live_real() {
+        let intent = OrderLifecycleEvent {
+            schema_version: "v1".to_string(),
+            ts: Utc::now(),
+            client_order_id: "c4".to_string(),
+            order_id: None,
+            ticker: "KXTEST".to_string(),
+            outcome_id: "yes".to_string(),
+            side: crate::execution::types::Side::Buy,
+            tif: crate::execution::types::TimeInForce::Gtc,
+            limit_price: Some(0.5),
+            requested_qty: 10.0,
+            filled_qty: 10.0,
+            avg_fill_price: Some(0.50),
+            fee_paid: None,
+            signal_fair_price: None,
+            signal_observed_price: None,
+            signal_edge_pct: None,
+            signal_confidence: None,
+            signal_origin: Some("model_candidate".to_string()),
+            execution_mode: Some("live".to_string()),
+            is_synthetic: false,
+            status: Some(OrderStatus::Filled),
+            event_type: "intent".to_string(),
+            error: None,
+        };
+        let result = classify_execution_source(&intent, &[intent.clone()], None);
+        assert_eq!(result, "live_real");
+    }
+
+    #[test]
     fn split_assignment_is_time_based() {
         let mut rows = Vec::new();
         for i in 0..10 {

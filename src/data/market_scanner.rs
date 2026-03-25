@@ -15,6 +15,13 @@ pub struct ScannerConfig {
     pub min_volume: f64,
     pub max_spread_cents: f64,
     pub ws_delta_window_secs: u64,
+    /// Series to always fetch first via targeted API calls, regardless of quota ordering.
+    /// Prevents KXMVE flooding from hiding NBA/NHL/etc. (set via BOT_SCAN_SERIES_ALLOWLIST).
+    pub series_allowlist: Vec<String>,
+    /// Series prefixes to skip in the general (non-allowlist) scan pass (BOT_SCAN_SERIES_BLOCKLIST).
+    pub series_blocklist: Vec<String>,
+    /// Max markets fetched per allowlist series query (BOT_SCAN_SERIES_MAX_PER_FETCH, default 200).
+    pub series_max_per_fetch: usize,
 }
 
 impl Default for ScannerConfig {
@@ -42,6 +49,23 @@ impl Default for ScannerConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(2)
                 .max(1),
+            series_allowlist: std::env::var("BOT_SCAN_SERIES_ALLOWLIST")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            series_blocklist: std::env::var("BOT_SCAN_SERIES_BLOCKLIST")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            series_max_per_fetch: std::env::var("BOT_SCAN_SERIES_MAX_PER_FETCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(200)
+                .max(10),
         }
     }
 }
@@ -90,15 +114,74 @@ impl KalshiMarketScanner {
     }
 
     pub async fn scan_snapshot(&self) -> Result<Vec<ScannedMarket>, ExecutionError> {
-        let mut out = Vec::with_capacity(self.cfg.max_markets);
+        let mut seen: HashMap<String, ScannedMarket> = HashMap::new();
+
+        // Tier 1: targeted queries for each allowlist series.
+        // These bypass the alphabetical ordering problem where KXMVE floods the quota
+        // before KXNBA/KXNHL/etc. can be reached.
+        // Small delay between requests to stay within Kalshi rate limits.
+        for (i, series) in self.cfg.series_allowlist.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let markets = self
+                .scan_pages(Some(series.as_str()), self.cfg.series_max_per_fetch)
+                .await
+                .unwrap_or_else(|err| {
+                    eprintln!("scan warning: series {series} failed: {err}");
+                    Vec::new()
+                });
+            for m in markets {
+                seen.entry(m.ticker.clone()).or_insert(m);
+            }
+        }
+
+        // Tier 2: general scan to fill remaining quota, skipping blocklisted series
+        // and markets already fetched in tier 1.
+        let remaining = self.cfg.max_markets.saturating_sub(seen.len());
+        if remaining > 0 {
+            let general = self.scan_pages(None, remaining + self.cfg.series_blocklist.len() * 1000).await?;
+            for m in general {
+                if seen.contains_key(&m.ticker) {
+                    continue;
+                }
+                let series = m.series_ticker.as_deref().unwrap_or("");
+                let blocked = self
+                    .cfg
+                    .series_blocklist
+                    .iter()
+                    .any(|b| series.starts_with(b.as_str()) || m.ticker.starts_with(b.as_str()));
+                if !blocked {
+                    seen.entry(m.ticker.clone()).or_insert(m);
+                }
+                if seen.len() >= self.cfg.max_markets {
+                    break;
+                }
+            }
+        }
+
+        Ok(seen.into_values().collect())
+    }
+
+    /// Paginate markets from the API. Pass `series_ticker` for targeted series queries,
+    /// or `None` for the general unfiltered scan.
+    async fn scan_pages(
+        &self,
+        series_ticker: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScannedMarket>, ExecutionError> {
+        let mut out = Vec::new();
         let mut cursor: Option<String> = None;
 
-        while out.len() < self.cfg.max_markets {
-            let page_size = (self.cfg.max_markets - out.len()).min(1000).to_string();
+        while out.len() < limit {
+            let page_size = (limit - out.len()).min(1000).to_string();
             let mut req = self
                 .http
                 .get(format!("{}/trade-api/v2/markets", self.cfg.api_base_url))
                 .query(&[("status", "open"), ("limit", page_size.as_str())]);
+            if let Some(series) = series_ticker {
+                req = req.query(&[("series_ticker", series)]);
+            }
             if let Some(c) = &cursor {
                 req = req.query(&[("cursor", c.as_str())]);
             }

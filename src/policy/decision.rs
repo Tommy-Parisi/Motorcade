@@ -352,4 +352,103 @@ mod tests {
         );
         assert!(!decision.should_trade);
     }
+
+    fn make_cfg(min_pnl: f64) -> PolicyConfig {
+        PolicyConfig {
+            mode: PolicyMode::Shadow,
+            shadow_enabled: false,
+            shadow_root: PathBuf::from("/tmp"),
+            min_expected_realized_pnl: min_pnl,
+            max_actions_per_candidate: 4,
+            default_legacy_fallback: true,
+        }
+    }
+
+    fn good_execution() -> ExecutionEstimate {
+        ExecutionEstimate {
+            ticker: "KXTEST".to_string(),
+            outcome_id: "yes".to_string(),
+            side: Side::Buy,
+            tif: TimeInForce::Gtc,
+            candidate_limit_price: 0.45,
+            fill_prob_30s: 0.8,
+            fill_prob_5m: 0.8,
+            expected_fill_price: 0.45,
+            expected_slippage_bps: 0.0,
+            expected_markout_bps_5m: 500.0,
+            expected_markout_bps_30m: 0.0,
+            model_version: "e".to_string(),
+        }
+    }
+
+    fn make_candidate() -> CandidateTrade {
+        CandidateTrade {
+            ticker: "KXTEST".to_string(),
+            side: Side::Buy,
+            outcome_id: "yes".to_string(),
+            fair_price: 0.65,
+            observed_price: 0.45,
+            edge_pct: 0.20,
+            confidence: 0.9,
+            rationale: "test".to_string(),
+        }
+    }
+
+    fn make_forecast(fair: f64) -> ForecastOutput {
+        ForecastOutput {
+            ticker: "KXTEST".to_string(),
+            fair_prob_yes: fair,
+            uncertainty: 0.1,
+            confidence: 0.9,
+            model_version: "m".to_string(),
+            feature_ts: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn policy_approves_positive_ev_trade() {
+        let cfg = make_cfg(0.0);
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), good_execution());
+        assert!(decision.should_trade, "expected should_trade=true, got {:?}", decision.rejection_reason);
+        assert!(decision.expected_realized_pnl > 0.0);
+        assert!(decision.size_multiplier > 0.0 && decision.size_multiplier <= 1.0);
+    }
+
+    #[test]
+    fn policy_uses_no_side_fair_for_no_outcome() {
+        let cfg = make_cfg(0.0);
+        let mut candidate = make_candidate();
+        candidate.outcome_id = "no".to_string();
+        // fair_prob_yes=0.30 → chosen_fair = 1 - 0.30 = 0.70
+        let forecast = make_forecast(0.30);
+        let execution = good_execution();
+        let decision = score_action(&cfg, &candidate, &forecast, execution);
+        // expected_gross_edge = 0.70 - 0.45 = 0.25 (positive)
+        assert!(decision.expected_gross_edge > 0.0);
+    }
+
+    #[test]
+    fn policy_threshold_filters_low_pnl() {
+        // min_expected_realized_pnl=5.0 should reject trades below that
+        let cfg = make_cfg(5.0);
+        let execution = ExecutionEstimate {
+            fill_prob_5m: 0.1, // low fill prob → low pnl
+            expected_markout_bps_5m: 0.0,
+            ..good_execution()
+        };
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), execution);
+        // With fill_prob_5m=0.1 and modest edge, pnl < 5.0 → reject
+        if decision.expected_realized_pnl < 5.0 {
+            assert!(!decision.should_trade);
+            assert!(decision.rejection_reason.is_some());
+        }
+    }
+
+    #[test]
+    fn size_multiplier_zero_when_should_not_trade() {
+        let cfg = make_cfg(1000.0); // impossibly high threshold
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), good_execution());
+        assert!(!decision.should_trade);
+        assert_eq!(decision.size_multiplier, 0.0);
+    }
 }

@@ -642,4 +642,125 @@ mod tests {
         assert!(out.fair_prob_yes > 0.0 && out.fair_prob_yes < 1.0);
         assert!(out.confidence >= 0.0 && out.confidence <= 1.0);
     }
+
+    #[test]
+    fn rate_bucket_posterior_mean_math() {
+        // 6 positives, 10 total, prior_mean=0.5, prior_strength=2.0
+        // posterior = (6 + 0.5*2) / (10 + 2) = 7/12 ≈ 0.5833
+        let bucket = RateBucket { positives: 6.0, total: 10.0 };
+        let result = bucket.posterior_mean(0.5, 2.0);
+        let expected = 7.0_f64 / 12.0;
+        assert!((result - expected).abs() < 1e-9, "got {result}, expected {expected}");
+    }
+
+    #[test]
+    fn rate_bucket_confidence_approaches_one_with_large_n() {
+        let bucket = RateBucket { positives: 1000.0, total: 1000.0 };
+        let conf = bucket.confidence(2.0); // 1000 / (1000+2)
+        assert!(conf > 0.99);
+        assert!(conf <= 1.0);
+    }
+
+    #[test]
+    fn model_shrinks_toward_global_without_vertical_bucket() {
+        // Train on sports only; predict weather (unseen vertical with min_bucket_samples=5)
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(sample_row("train", &format!("S{i}"), "sports", i % 3 != 0));
+        }
+        let artifact = train_artifact(&rows, 0, 0);
+        let model = ForecastModel::from_artifact(artifact.clone(), 5);
+
+        // Predict on unseen vertical "weather": only global bucket contributes
+        let feat = sample_row("test", "X", "weather", true).feature;
+        let out = model.predict(&feat);
+
+        // Global mean ≈ 7/10 with priors; fair_prob_yes should be reasonably close to global
+        assert!(out.fair_prob_yes > 0.4 && out.fair_prob_yes < 0.9);
+    }
+
+    #[test]
+    fn vertical_bucket_biases_prediction() {
+        // 9/10 weather markets resolve yes → weather posterior should be high
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(sample_row("train", &format!("W{i}"), "weather", i != 9));
+        }
+        // 1/10 sports markets resolve yes → sports posterior should be low
+        for i in 0..10 {
+            rows.push(sample_row("train", &format!("S{i}"), "sports", i == 0));
+        }
+
+        let artifact = train_artifact(&rows, 0, 0);
+        let model = ForecastModel::from_artifact(artifact, 1);
+
+        let weather_feat = sample_row("test", "WX", "weather", true).feature;
+        let sports_feat = sample_row("test", "SX", "sports", true).feature;
+
+        let weather_out = model.predict(&weather_feat);
+        let sports_out = model.predict(&sports_feat);
+
+        // Weather should predict higher probability than sports
+        assert!(weather_out.fair_prob_yes > sports_out.fair_prob_yes,
+            "weather={:.4} should > sports={:.4}", weather_out.fair_prob_yes, sports_out.fair_prob_yes);
+    }
+
+    #[test]
+    fn threshold_bucket_key_rounds_to_nearest_5() {
+        let mut feat = sample_row("test", "T", "weather", true).feature;
+        feat.threshold_value = Some(73.0);
+        feat.threshold_direction = Some("above".to_string());
+        // 73 / 5 = 14.6, rounds to 15, * 5 = 75
+        let key = threshold_bucket_key(&feat);
+        assert_eq!(key, Some("weather|above|75".to_string()));
+    }
+
+    #[test]
+    fn threshold_bucket_key_none_when_no_threshold() {
+        let mut feat = sample_row("test", "T", "weather", true).feature;
+        feat.threshold_value = None;
+        assert_eq!(threshold_bucket_key(&feat), None);
+    }
+
+    #[test]
+    fn normalize_key_lowercases_and_replaces_spaces() {
+        assert_eq!(normalize_key("Los Angeles"), "los_angeles");
+        assert_eq!(normalize_key("  KXBTC  "), "kxbtc");
+    }
+
+    #[test]
+    fn min_bucket_samples_suppresses_sparse_vertical() {
+        // Use a strongly-biased sports-only dataset so the global mean ≈ 0.1.
+        // The weather bucket (all-true, 3 rows) pulls away from global when min_samples=1
+        // but is suppressed when min_samples=5.
+        let mut rows = Vec::new();
+        // 27 sports rows resolving false → global mean ≈ 0.1
+        for i in 0..27 {
+            rows.push(sample_row("train", &format!("S{i}"), "sports", false));
+        }
+        for i in 0..3 {
+            rows.push(sample_row("train", &format!("S_true{i}"), "sports", true));
+        }
+        // 3 weather rows all true → weather bucket mean >> global mean
+        for i in 0..3 {
+            rows.push(sample_row("train", &format!("W{i}"), "weather", true));
+        }
+
+        let artifact = train_artifact(&rows, 0, 0);
+        // min_bucket_samples=5 → weather bucket (3 rows) not used
+        let model_strict = ForecastModel::from_artifact(artifact.clone(), 5);
+        // min_bucket_samples=1 → weather bucket is used
+        let model_loose = ForecastModel::from_artifact(artifact, 1);
+
+        let feat = sample_row("test", "X", "weather", true).feature;
+        let strict_out = model_strict.predict(&feat);
+        let loose_out = model_loose.predict(&feat);
+
+        // Both should be valid probabilities
+        assert!(strict_out.fair_prob_yes > 0.0 && strict_out.fair_prob_yes < 1.0);
+        assert!(loose_out.fair_prob_yes > 0.0 && loose_out.fair_prob_yes < 1.0);
+        // loose uses the all-true weather bucket → higher probability than strict
+        assert!(loose_out.fair_prob_yes > strict_out.fair_prob_yes,
+            "loose={:.4} should > strict={:.4}", loose_out.fair_prob_yes, strict_out.fair_prob_yes);
+    }
 }

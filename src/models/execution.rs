@@ -17,6 +17,9 @@ pub const EXECUTION_MODEL_KIND: &str = "empirical_execution_baseline";
 pub struct ExecutionTrainingConfig {
     pub enabled: bool,
     pub dataset_path: PathBuf,
+    /// Additional JSONL files merged into training (never overwritten by dataset builder).
+    /// Set via BOT_EXECUTION_SUPPLEMENTAL_PATHS (comma-separated).
+    pub supplemental_paths: Vec<PathBuf>,
     pub output_root: PathBuf,
     pub min_bucket_samples: usize,
     pub include_source_classes: Vec<String>,
@@ -35,6 +38,13 @@ impl ExecutionTrainingConfig {
             dataset_path: PathBuf::from(std::env::var("BOT_EXECUTION_DATASET_PATH").unwrap_or_else(
                 |_| "var/features/execution/execution_training.jsonl".to_string(),
             )),
+            supplemental_paths: std::env::var("BOT_EXECUTION_SUPPLEMENTAL_PATHS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect(),
             output_root: PathBuf::from(std::env::var("BOT_MODEL_EXECUTION_DIR").unwrap_or_else(
                 |_| "var/models/execution".to_string(),
             )),
@@ -138,6 +148,7 @@ pub struct ExecutionModelArtifact {
     pub by_vertical: HashMap<String, ExecutionBucket>,
     pub by_vertical_tif: HashMap<String, ExecutionBucket>,
     pub by_vertical_liquidity: HashMap<String, ExecutionBucket>,
+    pub by_aggressiveness: HashMap<String, ExecutionBucket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -306,6 +317,26 @@ impl ExecutionModel {
             );
         }
 
+        // Aggressiveness is the dominant predictor for fill probability:
+        // orders priced below ask never fill (IOC), orders at/above ask always do.
+        let agg_key = aggressiveness_bucket(feature.aggressiveness_bps);
+        if let Some(bucket) = self.lookup(&self.artifact.by_aggressiveness, agg_key) {
+            blend_bucket(
+                bucket,
+                &mut fill_30s,
+                &mut fill_5m,
+                &mut expected_fill_price,
+                &mut expected_markout_5m,
+                &mut expected_markout_30m,
+                global_fill_30s,
+                global_fill_5m,
+                global_fill_price,
+                global_markout_5m,
+                global_markout_30m,
+                0.60,
+            );
+        }
+
         let expected_slippage_bps = (((expected_fill_price - feature.candidate_limit_price)
             / feature.candidate_limit_price.max(0.0001))
             * 10_000.0)
@@ -339,7 +370,14 @@ impl ExecutionModel {
 }
 
 pub async fn run_execution_training(cfg: &ExecutionTrainingConfig) -> Result<(), ExecutionError> {
-    let rows = load_execution_training_rows(&cfg.dataset_path)?
+    let mut all_rows = load_execution_training_rows(&cfg.dataset_path)?;
+    for path in &cfg.supplemental_paths {
+        match load_execution_training_rows(path) {
+            Ok(rows) => all_rows.extend(rows),
+            Err(err) => eprintln!("execution training: skipping supplemental path {}: {}", path.display(), err),
+        }
+    }
+    let rows = all_rows
         .into_iter()
         .filter(|row| {
             cfg.include_source_classes
@@ -480,6 +518,7 @@ fn train_artifact(
     let mut by_vertical = HashMap::new();
     let mut by_vertical_tif = HashMap::new();
     let mut by_vertical_liquidity = HashMap::new();
+    let mut by_aggressiveness = HashMap::new();
     for row in train_rows {
         global.update(row);
         by_vertical
@@ -492,6 +531,10 @@ fn train_artifact(
             .update(row);
         by_vertical_liquidity
             .entry(format!("{}|{}", row.feature.vertical, liquidity_bucket(row.feature.volume)))
+            .or_insert_with(ExecutionBucket::default)
+            .update(row);
+        by_aggressiveness
+            .entry(aggressiveness_bucket(row.feature.aggressiveness_bps).to_string())
             .or_insert_with(ExecutionBucket::default)
             .update(row);
     }
@@ -512,6 +555,7 @@ fn train_artifact(
         by_vertical,
         by_vertical_tif,
         by_vertical_liquidity,
+        by_aggressiveness,
     }
 }
 
@@ -588,6 +632,16 @@ fn liquidity_bucket(volume: f64) -> &'static str {
         "medium"
     } else {
         "high"
+    }
+}
+
+fn aggressiveness_bucket(agg_bps: Option<f64>) -> &'static str {
+    match agg_bps {
+        None => "unknown",
+        Some(b) if b < -100.0 => "deep_miss",   // limit well below ask
+        Some(b) if b < 0.0 => "miss",            // limit below ask, won't fill IOC
+        Some(b) if b < 50.0 => "at_market",      // at or just above ask
+        Some(_) => "aggressive",                  // well above ask
     }
 }
 
@@ -698,5 +752,106 @@ mod tests {
         let out = model.predict(&sample_row("test", "weather", TimeInForce::Gtc, true).feature);
         assert!(out.fill_prob_30s > 0.0 && out.fill_prob_30s < 1.0);
         assert!(out.fill_prob_5m > 0.0 && out.fill_prob_5m < 1.0);
+    }
+
+    #[test]
+    fn aggressiveness_bucket_routing_is_correct() {
+        assert_eq!(aggressiveness_bucket(None), "unknown");
+        assert_eq!(aggressiveness_bucket(Some(-200.0)), "deep_miss");
+        assert_eq!(aggressiveness_bucket(Some(-50.0)), "miss");
+        assert_eq!(aggressiveness_bucket(Some(0.0)), "at_market");
+        assert_eq!(aggressiveness_bucket(Some(49.9)), "at_market");
+        assert_eq!(aggressiveness_bucket(Some(50.0)), "aggressive");
+        assert_eq!(aggressiveness_bucket(Some(500.0)), "aggressive");
+    }
+
+    #[test]
+    fn liquidity_bucket_routing_is_correct() {
+        assert_eq!(liquidity_bucket(0.0), "low");
+        assert_eq!(liquidity_bucket(999.9), "low");
+        assert_eq!(liquidity_bucket(1_000.0), "medium");
+        assert_eq!(liquidity_bucket(9_999.9), "medium");
+        assert_eq!(liquidity_bucket(10_000.0), "high");
+        assert_eq!(liquidity_bucket(1_000_000.0), "high");
+    }
+
+    #[test]
+    fn min_bucket_samples_filters_sparse_buckets() {
+        let train_rows = vec![
+            sample_row("train", "weather", TimeInForce::Gtc, true),
+            sample_row("train", "weather", TimeInForce::Gtc, true),
+            sample_row("train", "weather", TimeInForce::Gtc, false),
+        ];
+        let artifact = train_artifact(&train_rows, 0, 0);
+        // min_bucket_samples=10 means our 3-row bucket won't qualify
+        let model_strict = ExecutionModel::from_artifact(artifact.clone(), 10);
+        // min_bucket_samples=1 means it qualifies
+        let model_loose = ExecutionModel::from_artifact(artifact, 1);
+
+        let feat = sample_row("test", "weather", TimeInForce::Gtc, true).feature;
+        let out_strict = model_strict.predict(&feat);
+        let out_loose = model_loose.predict(&feat);
+
+        // Strict: no vertical bucket contributes → stays closer to global prior
+        // Loose: vertical bucket with 2/3 fills pushes fill_5m above global
+        // Both should be bounded and the loose model biases higher toward the bucket mean
+        assert!(out_strict.fill_prob_5m > 0.0 && out_strict.fill_prob_5m < 1.0);
+        assert!(out_loose.fill_prob_5m > 0.0 && out_loose.fill_prob_5m < 1.0);
+        // 2/3 fill rate in bucket should push loose estimate above strict (global-only) estimate
+        assert!(out_loose.fill_prob_5m > out_strict.fill_prob_5m);
+    }
+
+    #[test]
+    fn aggressiveness_bucket_dominates_fill_prediction() {
+        // Build model with high fill rate for "at_market" aggressiveness
+        let mut at_market_rows = vec![];
+        for _ in 0..10 {
+            let mut row = sample_row("train", "sports", TimeInForce::Ioc, true);
+            row.feature.aggressiveness_bps = Some(10.0); // at_market
+            at_market_rows.push(row);
+        }
+        let mut deep_miss_rows = vec![];
+        for _ in 0..10 {
+            let mut row = sample_row("train", "sports", TimeInForce::Ioc, false);
+            row.feature.aggressiveness_bps = Some(-200.0); // deep_miss
+            deep_miss_rows.push(row);
+        }
+        let mut all = at_market_rows;
+        all.extend(deep_miss_rows);
+        let artifact = train_artifact(&all, 0, 0);
+        let model = ExecutionModel::from_artifact(artifact, 1);
+
+        let mut feat_at_market = sample_row("test", "sports", TimeInForce::Ioc, true).feature;
+        feat_at_market.aggressiveness_bps = Some(10.0);
+        let mut feat_deep_miss = sample_row("test", "sports", TimeInForce::Ioc, true).feature;
+        feat_deep_miss.aggressiveness_bps = Some(-200.0);
+
+        let out_at_market = model.predict(&feat_at_market);
+        let out_deep_miss = model.predict(&feat_deep_miss);
+
+        // at_market should fill more reliably than deep_miss
+        assert!(out_at_market.fill_prob_5m > out_deep_miss.fill_prob_5m);
+    }
+
+    #[test]
+    fn probability_bucket_posterior_mean_math() {
+        // With 8 positives out of 10 total and prior_mean=0.25, prior_strength=4.0:
+        // posterior = (8 + 0.25*4) / (10 + 4) = (8 + 1) / 14 = 9/14 ≈ 0.6429
+        let bucket = ProbabilityBucket { positives: 8.0, total: 10.0 };
+        let result = bucket.posterior_mean(0.25, 4.0);
+        let expected = 9.0_f64 / 14.0;
+        assert!((result - expected).abs() < 1e-9, "got {result}, expected {expected}");
+    }
+
+    #[test]
+    fn rate_bucket_running_mean_returns_none_when_empty() {
+        let rm = RunningMean { total: 0.0, count: 0.0 };
+        assert!(rm.mean().is_none());
+    }
+
+    #[test]
+    fn rate_bucket_running_mean_computes_correctly() {
+        let rm = RunningMean { total: 30.0, count: 3.0 };
+        assert_eq!(rm.mean(), Some(10.0));
     }
 }

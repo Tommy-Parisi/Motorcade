@@ -168,6 +168,8 @@ pub struct MarketValuation {
     pub ticker: String,
     pub fair_prob_yes: f64,
     pub market_mid_prob_yes: f64,
+    pub yes_ask_cents: Option<f64>,
+    pub yes_bid_cents: Option<f64>,
     pub market_volume: f64,
     pub spread_cents: Option<f64>,
     pub confidence: f64,
@@ -272,8 +274,11 @@ impl ClaudeValuationEngine {
             self.record_batch_mode(mode);
             let input_by_ticker: HashMap<String, ValuationInput> =
                 unresolved.iter().map(|i| (i.market.ticker.clone(), i.clone())).collect();
-            for v in inferred {
+            for mut v in inferred {
                 if let Some(input) = input_by_ticker.get(&v.ticker) {
+                    // Attach actual bid/ask from market data — Claude doesn't return these.
+                    v.yes_ask_cents = input.market.yes_ask_cents;
+                    v.yes_bid_cents = input.market.yes_bid_cents;
                     self.put_cached(input, &v);
                 }
                 out.push(v);
@@ -316,28 +321,27 @@ impl ClaudeValuationEngine {
         let mut out = Vec::new();
         let total_cost_prob = (self.cfg.fee_bps + self.cfg.slippage_bps) / 10_000.0;
         for v in valuations {
-            let raw_edge = v.fair_prob_yes - v.market_mid_prob_yes;
-            let adjusted = raw_edge.abs() - total_cost_prob;
+            // Use actual ask/bid for edge — paying mid is not achievable with IOC.
+            // YES buy: edge = fair - ask. NO buy: edge = (1-fair) - (1-bid) = bid - fair... wait,
+            // NO ask = (100 - yes_bid) / 100, so NO edge = (1-fair) - no_ask.
+            let yes_ask = v.yes_ask_cents.map(|c| c / 100.0).unwrap_or(v.market_mid_prob_yes);
+            let no_ask = v.yes_bid_cents.map(|c| (100.0 - c) / 100.0).unwrap_or(1.0 - v.market_mid_prob_yes);
+
+            let yes_edge = v.fair_prob_yes - yes_ask;
+            let no_edge = (1.0 - v.fair_prob_yes) - no_ask;
+
+            let (raw_edge, outcome_id, fair_price, observed_price) = if yes_edge >= no_edge {
+                (yes_edge, "yes".to_string(), v.fair_prob_yes.clamp(0.01, 0.99), yes_ask.clamp(0.01, 0.99))
+            } else {
+                (no_edge, "no".to_string(), (1.0 - v.fair_prob_yes).clamp(0.01, 0.99), no_ask.clamp(0.01, 0.99))
+            };
+            let side = Side::Buy;
+
+            let adjusted = raw_edge - total_cost_prob;
             let effective_threshold = self.effective_threshold_for_valuation(v, threshold);
             if adjusted < effective_threshold {
                 continue;
             }
-
-            let (outcome_id, fair_price, observed_price, side) = if raw_edge >= 0.0 {
-                (
-                    "yes".to_string(),
-                    v.fair_prob_yes.clamp(0.01, 0.99),
-                    v.market_mid_prob_yes.clamp(0.01, 0.99),
-                    Side::Buy,
-                )
-            } else {
-                (
-                    "no".to_string(),
-                    (1.0 - v.fair_prob_yes).clamp(0.01, 0.99),
-                    (1.0 - v.market_mid_prob_yes).clamp(0.01, 0.99),
-                    Side::Buy,
-                )
-            };
 
             let mut rationale = v.rationale.clone();
             if relaxed_mode {
@@ -394,11 +398,13 @@ impl ClaudeValuationEngine {
         let mut edges: Vec<CandidateEdgeSnapshot> = valuations
             .iter()
             .map(|v| {
-                let raw_edge = v.fair_prob_yes - v.market_mid_prob_yes;
+                let yes_ask = v.yes_ask_cents.map(|c| c / 100.0).unwrap_or(v.market_mid_prob_yes);
+                let no_ask = v.yes_bid_cents.map(|c| (100.0 - c) / 100.0).unwrap_or(1.0 - v.market_mid_prob_yes);
+                let raw_edge = (v.fair_prob_yes - yes_ask).max((1.0 - v.fair_prob_yes) - no_ask);
                 CandidateEdgeSnapshot {
                     ticker: v.ticker.clone(),
                     raw_edge,
-                    adjusted_edge: raw_edge.abs() - total_cost_prob,
+                    adjusted_edge: raw_edge - total_cost_prob,
                     effective_threshold: self.effective_threshold_for_valuation(v, self.cfg.mispricing_threshold),
                     confidence: v.confidence,
                 }
@@ -538,6 +544,8 @@ impl ClaudeValuationEngine {
                     ticker: p.ticker,
                     fair_prob_yes: p.fair_prob_yes.clamp(0.01, 0.99),
                     market_mid_prob_yes: market_mid_prob_yes(&input.market).unwrap_or(0.5),
+                    yes_ask_cents: input.market.yes_ask_cents,
+                    yes_bid_cents: input.market.yes_bid_cents,
                     market_volume: input.market.volume,
                     spread_cents: input.market.spread_cents(),
                     confidence: p.confidence.clamp(0.0, 1.0),
@@ -569,6 +577,8 @@ impl ClaudeValuationEngine {
                     ticker: i.market.ticker.clone(),
                     fair_prob_yes: fair,
                     market_mid_prob_yes: mid,
+                    yes_ask_cents: i.market.yes_ask_cents,
+                    yes_bid_cents: i.market.yes_bid_cents,
                     market_volume: i.market.volume,
                     spread_cents: i.market.spread_cents(),
                     confidence: i.enrichment.as_ref().map(|_| 0.62).unwrap_or(0.45),
@@ -811,6 +821,8 @@ mod tests {
             ticker: "KX".to_string(),
             fair_prob_yes: 0.70,
             market_mid_prob_yes: 0.50,
+            yes_ask_cents: Some(52.0),
+            yes_bid_cents: Some(48.0),
             market_volume: 10_000.0,
             spread_cents: Some(4.0),
             confidence: 0.8,
@@ -837,6 +849,8 @@ mod tests {
             ticker: "KX".to_string(),
             fair_prob_yes: 0.53,
             market_mid_prob_yes: 0.50,
+            yes_ask_cents: Some(52.0),
+            yes_bid_cents: Some(48.0),
             market_volume: 10_000.0,
             spread_cents: Some(4.0),
             confidence: 0.8,
@@ -863,6 +877,8 @@ mod tests {
             ticker: "KX".to_string(),
             fair_prob_yes: 0.56,
             market_mid_prob_yes: 0.52,
+            yes_ask_cents: Some(53.0),
+            yes_bid_cents: Some(51.0),
             market_volume: 120_000.0,
             spread_cents: Some(2.0),
             confidence: 0.85,
@@ -930,5 +946,147 @@ mod tests {
         let parsed = parse_claude_valuation_items(raw).expect("embedded json should parse");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].ticker, "KX3");
+    }
+
+    fn make_valuation(fair: f64, ask_cents: Option<f64>, bid_cents: Option<f64>) -> MarketValuation {
+        let mid = ask_cents.and_then(|a| bid_cents.map(|b| (a + b) / 2.0 / 100.0)).unwrap_or(0.5);
+        MarketValuation {
+            ticker: "KX".to_string(),
+            fair_prob_yes: fair,
+            market_mid_prob_yes: mid,
+            yes_ask_cents: ask_cents,
+            yes_bid_cents: bid_cents,
+            market_volume: 5_000.0,
+            spread_cents: ask_cents.and_then(|a| bid_cents.map(|b| a - b)),
+            confidence: 0.8,
+            rationale: "test".to_string(),
+            stale_after: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn ask_based_edge_yes_buy_route() {
+        // fair=0.70, ask=0.55 → yes_edge=0.15, no_ask=(100-55)/100=0.45, no_edge=(1-0.70)-0.45=-0.15
+        // YES edge wins → outcome_id=yes, observed_price=0.55
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        let vals = vec![make_valuation(0.70, Some(55.0), Some(45.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].outcome_id, "yes");
+        assert!((candidates[0].observed_price - 0.55).abs() < 1e-9);
+        assert!((candidates[0].fair_price - 0.70).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ask_based_edge_no_buy_route() {
+        // fair=0.25, ask=0.55, bid=0.45
+        // yes_edge = 0.25 - 0.55 = -0.30
+        // no_ask = (100-45)/100 = 0.55
+        // no_edge = (1-0.25) - 0.55 = 0.75 - 0.55 = 0.20
+        // NO edge wins → outcome_id=no, observed_price=0.55, fair_price=1-0.25=0.75
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        let vals = vec![make_valuation(0.25, Some(55.0), Some(45.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].outcome_id, "no");
+        assert!((candidates[0].observed_price - 0.55).abs() < 1e-9);
+        assert!((candidates[0].fair_price - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn edge_below_threshold_produces_no_candidate() {
+        // fair=0.52, ask=0.52 → raw_edge=0.0, which is below threshold 0.08
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        let vals = vec![make_valuation(0.52, Some(52.0), Some(48.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert!(candidates.is_empty(), "expected no candidates for edge=0");
+    }
+
+    #[test]
+    fn fee_and_slippage_reduce_effective_edge() {
+        // fair=0.65, ask=0.55 → raw_edge=0.10
+        // fee_bps=15, slippage_bps=20 → total_cost = 35/10000 = 0.0035
+        // adjusted = 0.10 - 0.0035 = 0.0965, threshold=0.08 → should pass
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 15.0,
+            slippage_bps: 20.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        let vals = vec![make_valuation(0.65, Some(55.0), Some(45.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert_eq!(candidates.len(), 1);
+        // edge_pct ≈ 0.0965
+        assert!((candidates[0].edge_pct - 0.0965).abs() < 0.001);
+    }
+
+    #[test]
+    fn edge_strictly_above_threshold_is_included_and_at_or_below_is_not() {
+        // Filter uses adjusted < threshold (strict), so edge must be > threshold to pass.
+        // Due to float arithmetic, test with clear margin above/below rather than equality.
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+
+        // fair=0.65, ask=0.55 → yes_edge=0.10 > 0.08 → included
+        let above = engine.generate_candidates(&[make_valuation(0.65, Some(55.0), Some(45.0))]);
+        assert_eq!(above.len(), 1);
+
+        // fair=0.60, ask=0.55 → yes_edge=0.05 < 0.08 → excluded
+        let below = engine.generate_candidates(&[make_valuation(0.60, Some(55.0), Some(45.0))]);
+        assert!(below.is_empty());
+    }
+
+    #[test]
+    fn mid_price_used_as_fallback_when_no_ask() {
+        // No ask_cents → falls back to market_mid_prob_yes = 0.50
+        // fair=0.62 → yes_edge = 0.62 - 0.50 = 0.12, threshold=0.08 → pass
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        // Construct manually since make_valuation mid depends on bid/ask
+        let vals = vec![MarketValuation {
+            ticker: "KX".to_string(),
+            fair_prob_yes: 0.62,
+            market_mid_prob_yes: 0.50,
+            yes_ask_cents: None,
+            yes_bid_cents: None,
+            market_volume: 5_000.0,
+            spread_cents: None,
+            confidence: 0.8,
+            rationale: "test".to_string(),
+            stale_after: Utc::now(),
+        }];
+        let candidates = engine.generate_candidates(&vals);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].outcome_id, "yes");
+        assert!((candidates[0].observed_price - 0.50).abs() < 1e-9);
     }
 }
