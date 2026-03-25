@@ -648,44 +648,31 @@ scripts/morning_review.sh
 ### Overnight run
 
 ```bash
-cargo run --release 2>&1 | tee var/logs/overnight_$(date +%Y-%m-%d).log
+caffeinate -dimsu scripts/run_live_shadow.sh | tee var/logs/overnight_$(date +%Y-%m-%d).log
 ```
 
 ### Run one normal cycle
 
 ```bash
-BOT_RUN_ONCE=true cargo run --quiet
+BOT_RUN_ONCE=true scripts/run_live_shadow.sh
 ```
 
 ### Run a safe live cycle with policy shadow
 
 ```bash
-BOT_EXECUTION_MODE=live \
-BOT_RUN_SMOKE_TEST=true \
-BOT_RUN_ONCE=true \
-BOT_POLICY_MODE=shadow \
-BOT_MODEL_FORECAST_PATH=var/models/forecast/latest.json \
-BOT_MODEL_EXECUTION_PATH=var/models/execution/latest.json \
-BOT_FORECAST_SHADOW_ENABLED=true \
-BOT_EXECUTION_SHADOW_ENABLED=true \
-BOT_POLICY_SHADOW_ENABLED=true \
-cargo run --quiet
+BOT_RUN_ONCE=true scripts/run_live_shadow.sh
 ```
 
 ### Run research capture only
 
 ```bash
-BOT_RUN_RESEARCH_CAPTURE_ONLY=true \
-BOT_RUN_ONCE=true \
-cargo run --quiet
+BOT_RUN_ONCE=true scripts/run_research_capture.sh
 ```
 
 ### Run research paper capture only
 
 ```bash
-BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY=true \
-BOT_RUN_ONCE=true \
-cargo run --quiet
+BOT_RUN_ONCE=true scripts/run_research_paper_capture.sh
 ```
 
 ### Backfill outcomes
@@ -715,7 +702,7 @@ BOT_RUN_EXECUTION_TRAIN=true cargo run --quiet
 ### Generate model report
 
 ```bash
-BOT_RUN_MODEL_REPORT=true cargo run --quiet
+scripts/morning_review.sh
 ```
 
 ### Generate policy report
@@ -729,6 +716,16 @@ BOT_RUN_POLICY_REPORT=true cargo run --quiet
 ```bash
 BOT_RUN_RESEARCH_REPORT=true cargo run --quiet
 ```
+
+### Rebuild datasets and models
+
+```bash
+scripts/rebuild_models.sh
+```
+
+### Manual cargo entrypoints
+
+The script entrypoints above are the recommended default. If you need to bypass them for debugging or one-off experiments, the raw `cargo run` mode flags still work.
 
 ## Open Source and Contribution Rules
 

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -189,7 +189,7 @@ async fn main() {
     };
 
     let mode = execution_mode_from_env();
-    let engine = ExecutionEngine::new(client, engine_config_from_env(), mode);
+    let engine_cfg = engine_config_from_env();
     let forecast_runtime = ForecastRuntimeConfig::from_env();
     let forecast_model = match load_runtime_model(&forecast_runtime) {
         Ok(model) => model,
@@ -206,6 +206,12 @@ async fn main() {
             None
         }
     };
+    if let Err(err) = validate_startup_paths(&engine_cfg, &forecast_runtime, &execution_runtime) {
+        eprintln!("startup validation failed: {err}");
+        return;
+    }
+    let engine = ExecutionEngine::new(client, engine_cfg, mode);
+
     let runtime = BotRuntime {
         mode,
         engine,
@@ -254,6 +260,38 @@ async fn main() {
         interval.tick().await;
         run_cycle(&runtime).await;
     }
+}
+
+fn validate_startup_paths(
+    engine_cfg: &EngineConfig,
+    forecast_runtime: &ForecastRuntimeConfig,
+    execution_runtime: &ExecutionRuntimeConfig,
+) -> Result<(), String> {
+    ensure_parent_dir(&engine_cfg.state_path)?;
+    ensure_parent_dir(&engine_cfg.journal_path)?;
+    ensure_optional_path_parent(forecast_runtime.model_path.as_ref())?;
+    ensure_optional_path_parent(execution_runtime.model_path.as_ref())?;
+    Ok(())
+}
+
+fn ensure_parent_dir(path_str: &str) -> Result<(), String> {
+    let path = Path::new(path_str);
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to prepare {}: {}", parent.display(), err))
+}
+
+fn ensure_optional_path_parent(path: Option<&PathBuf>) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to prepare {}: {}", parent.display(), err))
 }
 
 async fn run_research_capture_mode() -> Result<(), execution::types::ExecutionError> {

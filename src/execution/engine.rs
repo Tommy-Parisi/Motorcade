@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::collections::BTreeMap;
@@ -25,6 +25,9 @@ pub struct ExecutionEngine {
     config: EngineConfig,
     mode: ExecutionMode,
 }
+
+const RUNTIME_STATE_SCHEMA_VERSION: &str = "v2";
+const JOURNAL_SCHEMA_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DailyPnlSummary {
@@ -516,8 +519,22 @@ impl ExecutionEngine {
             return Ok(RuntimeState::default_for_today());
         }
         let text = fs::read_to_string(path).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-        let mut state: RuntimeState =
-            serde_json::from_str(&text).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+        if text.trim().is_empty() {
+            return Ok(RuntimeState::default_for_today());
+        }
+        let mut state: RuntimeState = match serde_json::from_str(&text) {
+            Ok(state) => state,
+            Err(err) => {
+                quarantine_corrupt_file(path, "runtime_state");
+                eprintln!(
+                    "state recovery warning: failed to parse {}; moved corrupt file aside and reset state: {}",
+                    path.display(),
+                    err
+                );
+                return Ok(RuntimeState::default_for_today());
+            }
+        };
+        state.schema_version = RUNTIME_STATE_SCHEMA_VERSION.to_string();
         state.roll_day_if_needed();
         Ok(state)
     }
@@ -528,7 +545,9 @@ impl ExecutionEngine {
             fs::create_dir_all(parent).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
         }
         let data = serde_json::to_string_pretty(state).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-        fs::write(path, data).map_err(|e| ExecutionError::Exchange(e.to_string()))
+        let tmp_path = temp_path_for(path, "tmp");
+        fs::write(&tmp_path, data).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|e| ExecutionError::Exchange(e.to_string()))
     }
 
     fn append_journal(&self, event: &str, payload: serde_json::Value) -> Result<(), ExecutionError> {
@@ -537,6 +556,7 @@ impl ExecutionEngine {
             fs::create_dir_all(parent).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
         }
         let entry = JournalEntry {
+            schema_version: JOURNAL_SCHEMA_VERSION.to_string(),
             ts: Utc::now(),
             event: event.to_string(),
             payload,
@@ -582,6 +602,17 @@ fn compute_limit_price(side: Side, observed_price: f64) -> f64 {
     }
 }
 
+fn temp_path_for(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".{}", suffix));
+    PathBuf::from(os)
+}
+
+fn quarantine_corrupt_file(path: &Path, label: &str) {
+    let corrupt_path = temp_path_for(path, &format!("{}.corrupt", label));
+    let _ = fs::rename(path, corrupt_path);
+}
+
 fn approximate_kelly_fraction(signal: &TradeSignal) -> f64 {
     let p = signal.fair_price.clamp(0.01, 0.99);
     let q = 1.0 - p;
@@ -592,6 +623,8 @@ fn approximate_kelly_fraction(signal: &TradeSignal) -> f64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeState {
+    #[serde(default = "default_runtime_state_schema_version")]
+    schema_version: String,
     day: String,
     daily_realized_pnl: f64,
     open_exposure_notional: f64,
@@ -603,6 +636,7 @@ struct RuntimeState {
 impl RuntimeState {
     fn default_for_today() -> Self {
         Self {
+            schema_version: RUNTIME_STATE_SCHEMA_VERSION.to_string(),
             day: Utc::now().format("%Y-%m-%d").to_string(),
             daily_realized_pnl: 0.0,
             open_exposure_notional: 0.0,
@@ -622,6 +656,10 @@ impl RuntimeState {
     }
 }
 
+fn default_runtime_state_schema_version() -> String {
+    RUNTIME_STATE_SCHEMA_VERSION.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpenOrderState {
     order_id: String,
@@ -633,9 +671,15 @@ struct OpenOrderState {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JournalEntry {
+    #[serde(default = "default_journal_schema_version")]
+    schema_version: String,
     ts: DateTime<Utc>,
     event: String,
     payload: serde_json::Value,
+}
+
+fn default_journal_schema_version() -> String {
+    JOURNAL_SCHEMA_VERSION.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,8 +714,10 @@ pub fn summarize_performance_paths(state_path: &str, journal_path: &str) -> Resu
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: JournalEntry =
-                serde_json::from_str(line).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+            let entry: JournalEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
             let day = entry.ts.format("%Y-%m-%d").to_string();
             let day_summary = summary.by_day.entry(day).or_default();
 
@@ -729,10 +775,11 @@ pub fn summarize_performance_paths(state_path: &str, journal_path: &str) -> Resu
     let state_p = Path::new(state_path);
     if state_p.exists() {
         let text = fs::read_to_string(state_p).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-        let state: RuntimeState = serde_json::from_str(&text).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-        summary.state_day = Some(state.day);
-        summary.state_daily_realized_pnl = Some(state.daily_realized_pnl);
-        summary.state_open_exposure_notional = Some(state.open_exposure_notional);
+        if let Ok(state) = serde_json::from_str::<RuntimeState>(&text) {
+            summary.state_day = Some(state.day);
+            summary.state_daily_realized_pnl = Some(state.daily_realized_pnl);
+            summary.state_open_exposure_notional = Some(state.open_exposure_notional);
+        }
     }
 
     Ok(summary)
@@ -744,6 +791,7 @@ mod tests {
     use async_trait::async_trait;
     use crate::execution::client::ExchangeClient;
     use crate::execution::types::Side;
+    use tempfile::tempdir;
 
     fn base_signal() -> TradeSignal {
         TradeSignal {
@@ -757,6 +805,43 @@ mod tests {
             signal_timestamp: Utc::now(),
             signal_origin: Some("test".to_string()),
         }
+    }
+
+    #[test]
+    fn corrupt_runtime_state_is_quarantined_and_reset() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("runtime_state.json");
+        fs::write(&state_path, "{not json").unwrap();
+
+        let client: Arc<dyn ExchangeClient> = Arc::new(NoopClient);
+        let mut cfg = EngineConfig::default();
+        cfg.state_path = state_path.display().to_string();
+        cfg.journal_path = dir.path().join("journal.jsonl").display().to_string();
+        let engine = ExecutionEngine::new(client, cfg, ExecutionMode::Paper);
+
+        let state = engine.load_state().unwrap();
+        assert_eq!(state.schema_version, RUNTIME_STATE_SCHEMA_VERSION);
+        assert_eq!(state.daily_realized_pnl, 0.0);
+        assert!(!state_path.exists());
+        assert!(dir.path().join("runtime_state.json.runtime_state.corrupt").exists());
+    }
+
+    #[test]
+    fn save_state_uses_current_schema_version() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("runtime_state.json");
+
+        let client: Arc<dyn ExchangeClient> = Arc::new(NoopClient);
+        let mut cfg = EngineConfig::default();
+        cfg.state_path = state_path.display().to_string();
+        cfg.journal_path = dir.path().join("journal.jsonl").display().to_string();
+        let engine = ExecutionEngine::new(client, cfg, ExecutionMode::Paper);
+
+        let state = RuntimeState::default_for_today();
+        engine.save_state(&state).unwrap();
+
+        let raw = fs::read_to_string(&state_path).unwrap();
+        assert!(raw.contains(&format!("\"schema_version\": \"{}\"", RUNTIME_STATE_SCHEMA_VERSION)));
     }
 
     fn test_engine() -> ExecutionEngine {
