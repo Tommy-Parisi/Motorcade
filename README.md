@@ -1,411 +1,797 @@
 # EventTradingBot
 
-Autonomous trading agent for event markets, built in Rust for low-latency execution.
+A Rust trading and research system for Kalshi-style event contracts.
 
-## Strategy Loop (every 10 minutes)
+This repository combines two closely related jobs:
 
-1. Scan 500-1000 active markets.
-2. Build fair-value estimates using Claude.
-3. Detect mispricing opportunities greater than 8%.
-4. Compute position size using Kelly Criterion with a hard cap of 6% bankroll per trade.
-5. Execute orders.
-6. Route realized profits to cover API inference costs.
+1. operate a rules-based event trading loop with risk controls and exchange execution
+2. collect and process structured research data for a more execution-aware modeling stack
 
-## Market Verticals
+The codebase started as a live trading bot with heuristic and Claude-assisted valuation. It now also includes the foundation for a two-layer modeling system:
 
-- Weather markets: parse NOAA data before exchange prices fully react.
-- Sports markets: scrape injury reports and price lag.
-- Crypto markets: combine on-chain metrics and sentiment signals.
+- a forecast layer that estimates fair event probability
+- an execution layer that estimates whether that edge is actually tradable after fill behavior, slippage, and short-horizon markout
 
-## Planned Components
+The project is still in transition. The legacy trading path is fully usable. The forecast path is already useful in shadow mode. The execution-aware path is implemented end to end, but still data-limited and should be treated as research-stage.
 
-- `src/main.rs`: scheduler + orchestration entrypoint
-- `src/data/`: market ingestion + source adapters (NOAA, sports, on-chain)
-- `src/model/`: Claude valuation prompts, caching, and candidate generation
-- `src/risk/`: Kelly sizing + bankroll constraints
-- `src/execution/`: order routing + fill handling
-- `src/accounting/`: PnL + API bill coverage logic
+## What This Repo Does
 
-## Execution Engine Design
+At a high level, the system:
 
-Order execution is implemented in `src/execution/` with three layers:
+1. scans Kalshi markets
+2. enriches a subset of them with lightweight external signals
+3. values markets using either Claude or a heuristic fallback
+4. generates trade candidates
+5. allocates capital under bankroll and exposure constraints
+6. executes through either a paper simulator or the live Kalshi API
+7. records structured research data for later training and evaluation
+8. optionally runs forecast, execution, and policy models in shadow alongside the live system
 
-- `types.rs`: strict contracts for `TradeSignal`, `OrderRequest`, `ExecutionReport`, and failure modes.
-- `client.rs`: `ExchangeClient` trait and `KalshiClient` adapter boundary for API integration.
-- `engine.rs`: `ExecutionEngine` that enforces:
-  - minimum edge threshold (default 8%)
-  - stale signal rejection
-  - Kelly-based sizing with hard cap (default max 6% bankroll/trade)
-  - max notional per market guardrail
-  - retry logic for retryable exchange failures
+There are effectively two pipelines living side by side.
 
-Execution flow:
+### Legacy Trading Pipeline
 
-1. Validate signal freshness and edge.
-2. Compute position size from bankroll and Kelly fraction.
-3. Build IOC limit order with idempotent client order ID.
-4. Submit order and fetch order state/report.
+This is the currently trusted production path.
 
-## Kalshi Client Setup
+- market scan
+- market enrichment
+- valuation
+- candidate generation
+- allocation
+- execution
+- journal/state updates
 
-The live Kalshi client reads auth and routing from environment variables:
+### Research and Modeling Pipeline
 
-- `KALSHI_API_BASE_URL` (default `https://demo-api.kalshi.co`)
-- `KALSHI_WS_URL` (default `wss://demo-api.kalshi.co/trade-api/ws/v2`)
-- `KALSHI_API_KEY_ID`
-- `KALSHI_PRIVATE_KEY_PEM` or `KALSHI_PRIVATE_KEY_PATH`
-- `BOT_EXECUTION_MODE` (`paper` default, set `live` to place real orders)
-- `KALSHI_MARKET_ALIASES` (optional): comma-separated alias map, e.g. `btc120k=KXBTC-26DEC31-B120000,nyc90f=KXWEATHER-NYC-90F`
-- `BOT_MARKET_RESOLUTION`: `best_effort` (default) or `strict`
-- `BOT_MAX_DAILY_LOSS` (default `500`)
-- `BOT_MAX_OPEN_EXPOSURE` (default `15000`)
-- `BOT_MAX_ORDERS_PER_MIN` (default `20`)
-- `BOT_STATE_PATH` (default `var/state/runtime_state.json`)
-- `BOT_JOURNAL_PATH` (default `var/logs/trade_journal.jsonl`)
-- `BOT_MIN_EDGE_PCT` (default `0.08`; execution-time minimum edge gate)
-- `BOT_RUN_SMOKE_TEST` (`true/false`, default `false`)
-- `NOAA_POINT` (default `39.7456,-97.0892`)
-- `SPORTS_INJURY_API_URL` (optional)
-- `CRYPTO_SENTIMENT_API_URL` (optional; defaults to Alternative.me FNG)
-- `BOT_BANKROLL` (default `10000`)
-- `BOT_VALUATION_MARKETS` (default `250`)
-- `BOT_ENRICHMENT_MARKETS` (default `25`)
-- `BOT_SCAN_MAX_MARKETS` (default `1000`)
-- `BOT_SCAN_MIN_VOLUME` (default `1000`)
-- `BOT_SCAN_MAX_SPREAD_CENTS` (default `8`)
-- `BOT_SCAN_WS_DELTA_WINDOW_SECS` (default `2`)
-- `BOT_MISPRICING_THRESHOLD` (default `0.08`)
-- `BOT_MIN_CANDIDATES` (default `0`; when >0, backfills from real valuations if strict threshold returns too few)
-- `BOT_FALLBACK_MISPRICING_THRESHOLD` (default `0.02`; used only for the backfill path above)
-- `BOT_ADAPTIVE_THRESHOLD_ENABLED` (`true/false`, default `false`; uses liquidity/spread/confidence to set per-market effective thresholds)
-- `BOT_ADAPTIVE_THRESHOLD_FLOOR` (default `0.01`; minimum allowed adaptive threshold)
-- `BOT_ADAPTIVE_LIQUIDITY_VOLUME_REF` (default `50000`; higher volume lowers threshold toward floor)
-- `BOT_ADAPTIVE_SPREAD_REF_CENTS` (default `12`; tighter spreads lower threshold toward floor)
-- `BOT_ADAPTIVE_CONFIDENCE_WEIGHT` (default `0.20`)
-- `BOT_ADAPTIVE_LIQUIDITY_WEIGHT` (default `0.55`)
-- `BOT_ADAPTIVE_SPREAD_WEIGHT` (default `0.25`)
-- `BOT_FEE_BPS` (default `15`)
-- `BOT_SLIPPAGE_BPS` (default `20`)
-- `BOT_VALUATION_BATCH_SIZE` (default `32`)
-- `BOT_VALUATION_TIMEOUT_MS` (default `8000`)
-- `CLAUDE_MODEL` (default `claude-3-5-sonnet-latest`)
-- `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`)
-- `ANTHROPIC_API_KEY` (optional; without it, heuristic valuation fallback is used)
-- `BOT_ALLOW_HEURISTIC_IN_LIVE` (`true/false`, default `false`; live mode fails closed if heuristic fallback is used unless this is enabled)
-- `BOT_MAX_TRADES_PER_CYCLE` (default `5`)
-- `BOT_MAX_FRACTION_PER_TRADE` (default `0.06`)
-- `BOT_MAX_TOTAL_FRACTION_PER_CYCLE` (default `0.20`)
-- `BOT_MIN_FRACTION_PER_TRADE` (default `0.005`)
-- `BOT_ENFORCE_EVENT_MUTEX` (default `true`; prevents allocating both sides of the same underlying event root in one cycle)
-- `BOT_MAX_NOTIONAL_PER_TICKER` (default `500`; blocks new allocations when historical filled notional for ticker would exceed cap)
-- `BOT_REENTRY_COOLDOWN_SECS` (default `3600`; blocks re-buying the same ticker too soon after a fill)
-- `BOT_CYCLE_SECONDS` (default `600`, i.e. 10 minutes)
-- `BOT_CLAUDE_EVERY_N_CYCLES` (default `1`; run Claude valuation every N cycles, heuristic on other cycles for cost control)
-- `BOT_CLAUDE_TRIGGER_MODE` (`cadence` default, or `on_viable_markets`, or `on_heuristic_candidates`)
-  - `on_viable_markets`: Claude runs only on cycles with selected markets (skips no-market cycles).
-  - `on_heuristic_candidates`: heuristic runs first; Claude runs only if heuristic finds potential candidates.
-- `BOT_RUN_ONCE` (`true/false`, default `false`)
-- `BOT_FORCE_TEST_CANDIDATE` (`true/false`, default `false`; injects one deterministic candidate when none pass threshold)
-- `BOT_CYCLE_ARTIFACTS_ENABLED` (`true/false`, default `true`)
-- `BOT_CYCLE_ARTIFACTS_DIR` (default `var/cycles`)
-- `BOT_EXCHANGE_BACKEND` (`kalshi` default, `paper_sim` optional)
-- `BOT_RUN_REPLAY` (`true/false`, default `false`)
-- `BOT_REPLAY_DAYS` (default `3`)
-- `BOT_REPLAY_CYCLES_PER_DAY` (default `144`)
-- `BOT_REPLAY_BANKROLL` (default `10000`)
-- `BOT_RUN_SUMMARY_ONLY` (`true/false`, default `false`; prints aggregated PnL/trade summary from journal + state and exits)
-- `BOT_RUN_OUTCOME_BACKFILL` (`true/false`, default `false`; scans captured research logs for settled tickers, fetches final market status from Kalshi, and writes outcome labels to `var/research/outcomes/outcomes.jsonl`)
-- `BOT_OUTCOME_LOOKBACK_DAYS` (default `14`; only considers captured market-state days within this lookback window for outcome backfill)
-- `BOT_RUN_DATASET_BUILD` (`true/false`, default `false`; builds labeled forecast and execution training datasets from captured research logs)
-- `BOT_RUN_FORECAST_TRAIN` (`true/false`, default `false`; trains the Step 5 baseline forecast model from `var/features/forecast/forecast_training.jsonl`)
-- `BOT_FORECAST_DATASET_PATH` (default `var/features/forecast/forecast_training.jsonl`)
-- `BOT_MODEL_FORECAST_DIR` (default `var/models/forecast`)
-- `BOT_MODEL_FORECAST_MIN_BUCKET_SAMPLES` (default `5`; minimum bucket size before the baseline model trusts a specialized segment)
-- `BOT_MODEL_FORECAST_PATH` (optional; when set, loads a trained forecast artifact for per-cycle shadow scoring)
-- `BOT_FORECAST_SHADOW_ENABLED` (`true/false`, default `true`; controls whether runtime forecast shadow outputs are written)
-- `BOT_RUN_EXECUTION_TRAIN` (`true/false`, default `false`; trains the Step 6 baseline execution model from `var/features/execution/execution_training.jsonl`)
-- `BOT_EXECUTION_DATASET_PATH` (default `var/features/execution/execution_training.jsonl`)
-- `BOT_MODEL_EXECUTION_DIR` (default `var/models/execution`)
-- `BOT_MODEL_EXECUTION_PATH` (optional; when set, loads a trained execution artifact for per-cycle shadow scoring)
-- `BOT_MODEL_EXECUTION_MIN_BUCKET_SAMPLES` (default `5`)
-- `BOT_EXECUTION_SHADOW_ENABLED` (`true/false`, default `true`)
-- `BOT_POLICY_SHADOW_ENABLED` (`true/false`, default `true`; enables Step 7 policy shadow decisions)
-- `BOT_POLICY_MODE` (`legacy|shadow|active`, default `legacy`)
-- `BOT_RUN_POLICY_REPORT` (`true/false`, default `false`; summarizes policy behavior from saved cycle artifacts)
-- `BOT_POLICY_REPORT_CYCLE_DIR` (optional; defaults to the normal cycle artifact directory)
-- `BOT_RUN_MODEL_REPORT` (`true/false`, default `false`; evaluates the current forecast and execution artifacts against the latest datasets)
-- `BOT_MODEL_FORECAST_REPORT_PATH` (optional; defaults to `BOT_MODEL_FORECAST_PATH` or `var/models/forecast/latest.json`)
-- `BOT_MODEL_EXECUTION_REPORT_PATH` (optional; defaults to `BOT_MODEL_EXECUTION_PATH` or `var/models/execution/latest.json`)
-- `BOT_RUN_RESEARCH_CAPTURE_ONLY` (`true/false`, default `false`; runs scan + enrichment + research logging only, with no trading path)
-- `BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY` (`true/false`, default `false`; runs the full cycle against the paper simulator so research order-lifecycle logs are captured without live orders)
-- `BOT_POLICY_MIN_EXPECTED_REALIZED_PNL` (default `0.0`)
-- `BOT_POLICY_MAX_ACTIONS_PER_CANDIDATE` (default `4`)
-- `BOT_POLICY_DEFAULT_LEGACY_FALLBACK` (`true/false`, default `true`)
-- `BOT_SHADOW_DIR` (default `var/shadow`)
-- `BOT_FEATURES_DIR` (default `var/features`)
+This is the newer path used to improve the system over time.
 
-The client signs each request using Kalshi's `timestamp + METHOD + path` convention with RSA-PSS and sends:
-- `KALSHI-ACCESS-KEY`
-- `KALSHI-ACCESS-TIMESTAMP`
-- `KALSHI-ACCESS-SIGNATURE`
+- market-state capture
+- order-lifecycle capture
+- outcome backfill
+- dataset generation
+- forecast model training
+- execution model training
+- policy scoring and reporting
 
-## Market Symbol Mapper
+## Current State
 
-`src/markets/kalshi_mapper.rs` resolves strategy market inputs to Kalshi tickers by:
+The project is best understood as four layers.
 
-1. Checking alias overrides from `KALSHI_MARKET_ALIASES`
-2. Accepting already ticker-shaped inputs directly
-3. Querying `GET /trade-api/v2/markets` and matching against ticker/title/subtitle/event/series fields
+### 1. Trading Layer
 
-In `best_effort`, unresolved inputs log a warning and continue with the original value.
-In `strict`, unresolved or ambiguous inputs fail fast before order placement.
+Implemented and actively usable.
 
-## Market Scanning (Fastest Access Path)
+- Kalshi REST scanner
+- short websocket delta merge
+- live and paper execution engines
+- hybrid IOC/GTC execution policy
+- state tracking and journaling
+- risk guards for stale signals, edge thresholds, cooldowns, duplicate open orders, and notional caps
 
-Implemented scanner: `src/data/market_scanner.rs`
+### 2. Research Capture Layer
 
-Current flow:
+Implemented and actively usable.
 
-1. Pull open markets from `GET /trade-api/v2/markets` with cursor pagination and up to 1000 markets/page.
-2. Merge short-window WebSocket deltas (`ticker_v2`, `trade`) via `src/data/ws_delta.rs`.
-3. Filter to liquid + tight markets (volume + spread thresholds).
-4. Pass selected tickers to valuation.
+- point-in-time market-state logging
+- order-lifecycle logging
+- outcome backfill for settled markets
+- research coverage reporting
 
-Reasoning for speed:
+### 3. Modeling Layer
 
-1. Single large REST snapshots are fastest way to bootstrap 500-1000 markets.
-2. WebSocket deltas remove stale quotes between scan windows.
-3. Feature enrichment now uses provider-native APIs with in-process caching.
+Implemented, but still maturing.
+
+- baseline forecast model
+- baseline execution model
+- model report tooling
+- dataset builder
+
+### 4. Policy Layer
+
+Implemented, but recommended in `shadow` mode for now.
+
+- policy action scoring over a small action grid
+- expected realized PnL scoring
+- policy decision logging
+- policy report tooling
+
+## Recommended Reality Check
+
+The important practical distinction in this repo is:
+
+- the legacy trading loop is operational
+- the forecast model is promising
+- the execution model is still provisional
+- policy-driven execution should stay in `shadow` until there is more clean execution data
+
+That means:
+
+- `BOT_POLICY_MODE=shadow` is the recommended default for the new stack
+- `BOT_POLICY_MODE=active` exists, but should be used cautiously and only after manual review and more trustworthy execution data
+
+## Architecture
+
+## Top-Level Layout
+
+- `src/main.rs`
+  - runtime orchestration, mode selection, cycle execution
+- `src/data/`
+  - market scanning, websocket deltas, enrichment
+- `src/execution/`
+  - exchange client, paper simulator, execution engine, order types
+- `src/model/`
+  - legacy valuation and allocation logic
+- `src/features/`
+  - forecast and execution feature builders
+- `src/models/`
+  - forecast model, execution model, model reporting
+- `src/policy/`
+  - policy decision logic and reporting
+- `src/research/`
+  - structured market-state and order-lifecycle capture
+- `src/outcomes/`
+  - resolved outcome backfill
+- `src/datasets/`
+  - dataset generation from research logs
+- `src/replay/`
+  - replay utilities
+- `docs/`
+  - project roadmap and feature catalog
+- `var/`
+  - generated runtime, research, datasets, models, logs, and artifacts
+
+## Main Runtime Flow
+
+The normal runtime loop lives in `src/main.rs`.
+
+A typical cycle looks like this:
+
+1. scan open markets from Kalshi REST
+2. collect a short websocket delta window and merge quote/trade updates
+3. filter markets by volume and spread
+4. enrich a limited subset with weather, sports, or crypto context
+5. build valuation inputs
+6. optionally score the forecast model in shadow
+7. run Claude or heuristic valuation
+8. generate legacy candidate trades
+9. optionally score the execution model and policy layer in shadow
+10. allocate capital
+11. execute trades through live or paper execution
+12. append journals, runtime state, cycle artifacts, and research logs
+
+## Scanner and Market Selection
+
+The scanner lives in `src/data/market_scanner.rs`.
+
+It:
+
+- fetches open markets through `GET /trade-api/v2/markets`
+- normalizes Kalshi wire fields into `ScannedMarket`
+- merges short-lived websocket deltas from `ticker_v2` and `trade` channels
+- ranks and filters markets by:
+  - minimum volume
+  - maximum spread
+  - maximum market count
+
+The websocket layer lives in `src/data/ws_delta.rs`.
+
+It is intentionally lightweight. It is not a full depth-of-book feed. It exists to slightly improve point-in-time state over pure snapshot polling.
 
 ## Enrichment Layer
 
-Implemented: `src/data/market_enrichment.rs`
+The enricher lives in `src/data/market_enrichment.rs`.
 
-1. Detects market vertical (weather/sports/crypto).
-2. Fetches vertical signals:
-- Weather: NOAA (`api.weather.gov`)
-- Sports: configurable injury feed (`SPORTS_INJURY_API_URL`)
-- Crypto: sentiment feed (`CRYPTO_SENTIMENT_API_URL`, defaults to Alternative.me Fear & Greed)
-3. Caches enrichment by ticker with TTL (default 300s).
+It adds lightweight external context based on a coarse market vertical classification:
 
-## Valuation + Candidate Generation
+- weather: NOAA
+- sports: optional injury feed
+- crypto: optional sentiment feed
+- other: no enrichment
 
-Implemented: `src/model/valuation.rs`
+This is not a full prediction engine. It is a shallow signal layer that the legacy valuation engine and newer feature builders can use.
 
-1. Batch valuation (default 32 markets/request) with timeout/retry limits.
-2. Claude inference path via Anthropic Messages API.
-3. Heuristic fallback when API is unavailable.
-4. Prompt-size cap and per-batch token cap.
-5. Cache of unchanged market/enrichment inputs.
-6. Mispricing candidate generation with fee/slippage-adjusted edge threshold.
+## Valuation Layer
 
-## Portfolio Allocation
+The valuation engine lives in `src/model/valuation.rs`.
 
-Implemented: `src/model/allocator.rs`
+It supports two paths:
 
-1. Ranks candidates by edge * confidence.
-2. Applies Kelly-style sizing with per-trade and per-cycle bankroll caps.
-3. Filters tiny allocations and returns executable trade basket for the cycle.
+- Claude-enabled valuation
+- heuristic fallback valuation
 
-## Orchestrator Loop
+The valuation engine produces:
 
-`src/main.rs` now runs the full pipeline on a continuous loop:
+- `MarketValuation`
+- `CandidateTrade`
+- diagnostics about thresholds, edge, and fallback behavior
 
-1. snapshot + websocket delta scan
-2. enrichment
-3. valuation
-4. candidate generation
-5. allocation
-6. execution
+The legacy candidate logic is based on the difference between:
 
-Default cadence is every 600 seconds (10 minutes). Use `BOT_RUN_ONCE=true` for single-cycle dry runs.
+- estimated fair probability
+- observed market price
 
-## Deterministic Paper Simulation + Replay
+adjusted by configurable fee and slippage assumptions.
 
-Implemented:
+## Allocation Layer
 
-- Paper exchange backend: `src/execution/paper_sim.rs`
-- Multi-day replay harness: `src/replay/mod.rs`
+The allocator lives in `src/model/allocator.rs`.
 
-Simulation model includes:
+The legacy allocator:
 
-1. deterministic per-order latency
-2. deterministic slippage
-3. deterministic partial-fill / cancel outcomes
-4. fee model
+- ranks candidates by edge and confidence
+- uses a Kelly-like sizing approximation
+- caps per-trade and per-cycle bankroll fractions
+- can enforce one trade per event root via an event mutex
 
-Replay mode (`BOT_RUN_REPLAY=true`) runs synthetic multi-day cycles and prints:
+In newer policy-enabled modes, ranking can be influenced by expected realized PnL from the policy layer.
 
-1. total orders
-2. fill/partial/cancel counts
-3. fees paid
-4. edge-PnL net fees
+## Execution Layer
 
-For long paper/live runs, generate an end-of-run summary without executing trades:
+Execution logic lives in:
 
-`set -a; source .env; set +a; BOT_RUN_SUMMARY_ONLY=true cargo run --quiet`
+- `src/execution/engine.rs`
+- `src/execution/client.rs`
+- `src/execution/paper_sim.rs`
 
-To backfill outcome labels for settled markets captured in research logs:
+Capabilities include:
 
-`set -a; source .env; set +a; BOT_RUN_OUTCOME_BACKFILL=true cargo run --quiet`
+- paper execution mode
+- live Kalshi execution mode
+- IOC, GTC, and hybrid execution policies
+- order normalization against Kalshi market constraints
+- open-order reconciliation
+- journal logging
+- runtime state persistence
+- smoke testing for live exchange connectivity
 
-To build training datasets from captured research logs:
+The execution client also applies market constraints before submit, including:
 
-`set -a; source .env; set +a; BOT_RUN_DATASET_BUILD=true cargo run --quiet`
+- non-binary market rejection
+- tick/range snapping
+- normalized yes/no price handling
 
-To train the baseline Step 5 forecast model artifact from the forecast dataset:
+## Research Data Model
 
-`set -a; source .env; set +a; BOT_RUN_FORECAST_TRAIN=true cargo run --quiet`
+The research layer exists so the system can be trained and evaluated honestly.
 
-To train the baseline Step 6 execution model artifact from the execution dataset:
+### Market-State Capture
 
-`set -a; source .env; set +a; BOT_RUN_EXECUTION_TRAIN=true cargo run --quiet`
+Recorded in `src/research/market_recorder.rs`.
 
-Current dataset builder outputs JSONL training tables at:
+Written to:
+
+- `var/research/market_state/YYYY-MM-DD/market_state.jsonl`
+
+Each row captures a point-in-time market observation, including:
+
+- ticker and title metadata
+- bid/ask
+- implied mid
+- spread
+- volume
+- event and series identifiers when available
+- source (`snapshot` or `ws_delta`)
+- cycle id
+
+### Order-Lifecycle Capture
+
+Recorded in `src/research/order_recorder.rs`.
+
+Written to:
+
+- `var/research/order_lifecycle/YYYY-MM-DD/order_lifecycle.jsonl`
+
+Rows include:
+
+- order intent
+- ack
+- reconcile / terminal report
+- side and time in force
+- requested quantity
+- fill quantity
+- average fill price
+- fee paid
+- signal context at order time
+- execution mode
+- signal origin / provenance
+
+### Outcome Capture
+
+Resolved outcomes are written to:
+
+- `var/research/outcomes/outcomes.jsonl`
+
+The resolver in `src/outcomes/resolver.rs` scans captured market-state data, identifies markets whose close time is in the past, queries Kalshi for settlement state, and records final labels when resolution is available.
+
+## Data Provenance and Execution Source Classes
+
+One of the most important cleanups in this repo is explicit execution provenance.
+
+Execution rows are classified into:
+
+- `bootstrap_synthetic`
+- `organic_paper`
+- `live_real`
+
+This matters because not all execution data is equally useful.
+
+- bootstrap rows are useful for plumbing validation
+- organic paper rows are useful for early execution research
+- live real rows are the highest-value long-term execution labels
+
+Execution training defaults to:
+
+- `organic_paper`
+- `live_real`
+
+and excludes bootstrap synthetic rows by default.
+
+That change exists specifically to prevent fake or forced bootstrap activity from polluting execution-model training.
+
+## Feature Layer
+
+Feature builders live in:
+
+- `src/features/forecast.rs`
+- `src/features/execution.rs`
+
+The current feature layer includes:
+
+### Forecast Features
+
+- current market state
+- time-to-close and time features
+- parsed threshold and direction
+- inferred vertical
+- entity extraction from ticker/title
+- enrichment-derived context
+
+### Execution Features
+
+- action parameters such as side, TIF, and limit price
+- relative aggressiveness to observed price
+- market spread and liquidity bucket
+- forecast edge and confidence
+- simple order-history context such as:
+  - recent fills on same ticker
+  - recent cancels on same ticker
+  - same-event exposure
+
+This is a first feature layer, not a finished execution-research feature store.
+
+## Dataset Builder
+
+The dataset builder lives in `src/datasets/builder.rs`.
+
+It reads research logs and writes training tables to `var/features/`.
+
+### Forecast Dataset
+
+Written to:
 
 - `var/features/forecast/forecast_training.jsonl`
+
+It joins:
+
+- market-state observations
+- settled outcome labels
+
+### Execution Dataset
+
+Written to:
+
 - `var/features/execution/execution_training.jsonl`
+- `var/features/execution/execution_training_bootstrap.jsonl`
+- `var/features/execution/execution_training_organic_paper.jsonl`
+- `var/features/execution/execution_training_live_real.jsonl`
 
-These are the Step 4 foundation outputs. Parquet export is not wired yet.
+It groups order-lifecycle events by `client_order_id` and derives labels such as:
 
-Current forecast training writes JSON artifacts at:
+- filled within 30s
+- filled within 5m
+- terminal filled quantity
+- terminal average fill price
+- canceled / rejected
+- 5m and 30m markout
+- realized net PnL
 
-- `var/models/forecast/latest.json`
+Splits are time-based, not random.
+
+## Forecast Model
+
+The forecast model lives in `src/models/forecast.rs`.
+
+Current implementation:
+
+- empirical shrinkage baseline
+- bucketed by global, vertical, direction, entity, and threshold groupings
+
+Outputs:
+
+- `fair_prob_yes`
+- `uncertainty`
+- `confidence`
+- `model_version`
+- `feature_ts`
+
+Artifacts are written to:
+
 - `var/models/forecast/<version>/artifact.json`
+- `var/models/forecast/latest.json`
 - `var/models/forecast/manifest.jsonl`
 
-When `BOT_MODEL_FORECAST_PATH` is set, normal bot cycles also run the Step 5 model in shadow mode and write:
+The forecast model is currently the strongest part of the new modeling stack.
 
-- `var/shadow/forecast/YYYY-MM-DD/forecast_shadow.jsonl`
+## Execution Model
 
-This shadow path is read-only with respect to trading decisions. It does not change execution behavior yet.
+The execution model lives in `src/models/execution.rs`.
 
-When `BOT_MODEL_EXECUTION_PATH` is set, normal bot cycles also run the Step 6 execution model in shadow mode and write:
+Current implementation:
 
-- `var/shadow/execution/YYYY-MM-DD/execution_shadow.jsonl`
+- empirical execution baseline
+- bucketed by vertical, vertical+TIF, and vertical+liquidity
 
-The Step 6 baseline execution model currently estimates:
+Outputs:
 
-1. fill probability within 30 seconds
-2. fill probability within 5 minutes
-3. expected fill price
-4. expected 5-minute markout
-5. expected 30-minute markout
+- fill probability within 30s
+- fill probability within 5m
+- expected fill price
+- expected slippage in bps
+- expected 5m markout in bps
+- expected 30m markout in bps
 
-It is still a baseline empirical model. It does not control execution yet.
+Artifacts are written to:
 
-With both `BOT_MODEL_FORECAST_PATH` and `BOT_MODEL_EXECUTION_PATH` set, Step 7 policy shadow decisions are also written to:
+- `var/models/execution/<version>/artifact.json`
+- `var/models/execution/latest.json`
+- `var/models/execution/manifest.jsonl`
 
-- `var/shadow/policy/YYYY-MM-DD/policy_shadow.jsonl`
+Important caveat:
 
-The Step 7 policy layer currently scores a small action grid:
+The execution model is still small-sample and should be treated as provisional. It is useful for shadow analysis and research iteration, not as an unquestioned live control surface.
 
-1. `skip`
-2. `GTC` near observed price
-3. `IOC` near ask
-4. slightly less/more aggressive variants depending on spread
+## Policy Layer
 
-`BOT_POLICY_MODE` behavior:
+The policy layer lives in `src/policy/decision.rs`.
 
-1. `legacy`
-   - current allocator/execution path only
-   - shadow logs may still be written
-2. `shadow`
-   - same as `legacy`, but policy decisions are explicitly tracked as comparison outputs
-3. `active`
-   - requires both forecast and execution model artifacts
-   - filters legacy allocations through policy decisions
-   - rescales notional by `size_multiplier`
-   - overrides order pricing using the chosen policy limit price
+It combines:
 
-Current `active` mode is still conservative:
+- a forecast output
+- an execution estimate
+- a legacy candidate
+- current market state
 
-1. it fails closed if forecast or execution artifacts are missing
-2. it still uses the legacy allocator shell first
-3. policy influence is applied after legacy allocation and risk guards
+It scores a small action grid, typically variations of:
 
-To summarize saved cycle artifacts and compare legacy-vs-policy ranking behavior:
+- GTC near observed price
+- IOC near ask
+- more or less aggressive variants
+- implicit skip if expected realized PnL is negative
 
-`set -a; source .env; set +a; BOT_RUN_POLICY_REPORT=true cargo run --quiet`
+The policy output is `PolicyDecision`, which includes:
 
-To evaluate the current forecast and execution artifacts against the latest saved datasets:
+- whether to trade
+- chosen time in force
+- chosen limit price
+- size multiplier
+- expected fill probability
+- expected gross edge
+- expected realized PnL
+- rejection reason and rationale
 
-`set -a; source .env; set +a; BOT_RUN_MODEL_REPORT=true cargo run --quiet`
+## Policy Modes
 
-To collect market-state research data without entering the trading path:
+Policy mode is controlled by `BOT_POLICY_MODE`.
 
-`set -a; source .env; set +a; BOT_RUN_RESEARCH_CAPTURE_ONLY=true BOT_RUN_ONCE=true cargo run --quiet`
+### `legacy`
 
-For continuous capture at your normal cycle cadence:
+- legacy trading path decides trades
+- newer models may still run if separately enabled, but do not control execution
 
-`set -a; source .env; set +a; BOT_RUN_RESEARCH_CAPTURE_ONLY=true cargo run`
+### `shadow`
 
-To capture order-lifecycle research data safely through the paper simulator:
+- legacy trading path still executes
+- forecast, execution, and policy models run in parallel
+- shadow outputs are recorded for comparison
+- recommended mode today
 
-`set -a; source .env; set +a; BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY=true BOT_RUN_ONCE=true cargo run --quiet`
+### `active`
 
-If the strategy is not naturally producing candidates yet, add:
+- policy decisions influence ranking, pricing, and sizing
+- should only be used after manual review and stronger execution-data coverage
 
-`BOT_FORCE_TEST_CANDIDATE=true`
+## Reports and Artifacts
 
-That forces a deterministic paper-only candidate so `var/research/order_lifecycle` starts filling.
+### Cycle Artifacts
 
-The Step 5 baseline model is a shrinkage-based empirical forecaster that blends:
+The runtime writes per-cycle artifacts under:
 
-1. global historical outcome rate
-2. vertical-specific outcome rate
-3. vertical + threshold-direction bucket
-4. vertical + primary-entity bucket
-5. vertical + threshold bucket
+- `var/cycles/`
 
-It also reports validation and test log-loss/Brier metrics versus the market-mid baseline.
+These capture selected markets, valuations, candidates, policy decisions, allocations, and execution outcomes.
 
-The summary includes:
+### Model Reports
 
-1. total and per-day order counts
-2. filled/partial/canceled/rejected counts
-3. traded notional and fees paid
-4. expected edge PnL net fees (derived from logged signal edge on order intents)
-5. latest runtime state exposure and daily realized PnL snapshot
+Generated by `src/models/report.rs`.
 
-During normal cycles, the bot also prints a live mark-to-market snapshot of open positions based on current scanned market mids:
+These compare:
 
-1. `position marks: open_positions=... marked_positions=... total_unrealized=...`
-2. per-position rows with `entry`, latest `mark`, and `unrealized`
+- forecast model vs market-mid baseline
+- execution model performance on the selected source classes
 
-Execution logs now include Kalshi lookup hints and market titles for easier manual inspection.
+### Policy Reports
 
-## Trading Safety Controls
+Generated by `src/policy/report.rs`.
 
-The execution engine now includes production-oriented controls:
+These summarize:
 
-1. Pre-trade checks:
-- edge, staleness, size bounds, bankroll sufficiency
-2. Kill switches:
-- daily loss cap, open exposure cap, order-rate cap
-3. Post-trade controls:
-- poll/reconcile partial orders, auto-cancel lingering orders, startup open-order reconciliation
-4. Idempotency and dedupe:
-- persistent `client_order_id` memory across restarts
-5. Persistent audit trail:
-- JSON runtime state and JSONL journal under `BOT_STATE_PATH` / `BOT_JOURNAL_PATH`
+- cycle counts
+- policy mode usage
+- rank changes
+- should-trade vs rejected counts
+- average expected realized PnL
+- selected TIF distribution
 
-Recommended rollout:
+### Research Reports
 
-1. Run in `paper` mode until journal and state behavior look correct.
-2. Switch to Kalshi demo credentials in `live` with `BOT_RUN_SMOKE_TEST=true` first.
-3. Promote to production credentials only after a successful demo burn-in period.
+Generated by `src/research/report.rs`.
 
-## Local Control Page
+These summarize:
 
-Use `/Users/tommy/Desktop/Desktop_Thomas_MacBook_Pro/PolymarketTradingBot/control_panel.html` to generate run commands quickly with presets and persistent fields.
+- research file counts
+- row counts
+- unique tickers and client order ids
+- per-day collection volume
 
-Open it locally, choose a preset, then copy the generated command and run it in repo root after:
+## Important Environment Variables
 
-`set -a; source .env; set +a`
+This project is heavily env-driven. The most important controls are:
 
-## Notes
+### Exchange and execution
 
-This repository is initialized and connected to:
+- `KALSHI_API_BASE_URL`
+- `KALSHI_API_KEY_ID`
+- `KALSHI_PRIVATE_KEY_PEM` or equivalent private key env
+- `BOT_EXECUTION_MODE=paper|live`
+- `BOT_EXEC_POLICY=ioc|gtc|hybrid`
+- `BOT_HYBRID_IOC_FRACTION`
 
-`origin` remote on GitHub.
+### Market selection
+
+- `BOT_SCAN_MAX_MARKETS`
+- `BOT_SCAN_MIN_VOLUME`
+- `BOT_SCAN_MAX_SPREAD_CENTS`
+- `BOT_SCAN_WS_DELTA_WINDOW_SECS`
+
+### Valuation
+
+- `BOT_MISPRICING_THRESHOLD`
+- `BOT_FALLBACK_MISPRICING_THRESHOLD`
+- `BOT_MIN_CANDIDATES`
+- `BOT_ALLOW_HEURISTIC_IN_LIVE`
+- `CLAUDE_MODEL`
+- `ANTHROPIC_API_KEY`
+
+### Allocation and risk
+
+- `BOT_MAX_NOTIONAL_PER_TICKER`
+- `BOT_REENTRY_COOLDOWN_SECS`
+- `BOT_INVALID_PARAM_COOLDOWN_SECS`
+- `BOT_ENFORCE_EVENT_MUTEX`
+
+### Research and models
+
+- `BOT_RESEARCH_CAPTURE_ENABLED`
+- `BOT_RESEARCH_DIR`
+- `BOT_RUN_OUTCOME_BACKFILL`
+- `BOT_RUN_DATASET_BUILD`
+- `BOT_RUN_FORECAST_TRAIN`
+- `BOT_RUN_EXECUTION_TRAIN`
+- `BOT_MODEL_FORECAST_PATH`
+- `BOT_MODEL_EXECUTION_PATH`
+- `BOT_EXECUTION_TRAIN_SOURCES`
+
+### Policy and shadow
+
+- `BOT_POLICY_MODE=legacy|shadow|active`
+- `BOT_FORECAST_SHADOW_ENABLED`
+- `BOT_EXECUTION_SHADOW_ENABLED`
+- `BOT_POLICY_SHADOW_ENABLED`
+- `BOT_POLICY_MIN_EXPECTED_REALIZED_PNL`
+- `BOT_POLICY_MAX_ACTIONS_PER_CANDIDATE`
+
+## Common Workflows
+
+Load env first:
+
+```bash
+set -a; source .env; set +a
+```
+
+### Morning routine (run after overnight)
+
+```bash
+BOT_RUN_OUTCOME_BACKFILL=true cargo run --release --quiet   # pull resolutions from Kalshi
+BOT_RUN_DATASET_BUILD=true cargo run --release --quiet       # rebuild training datasets
+python3 scripts/check_fills.py                               # check paper fill win/loss rate
+python3 scripts/evaluate_shadow.py                           # forecast calibration + policy hit rate
+BOT_RUN_FORECAST_TRAIN=true cargo run --release --quiet      # retrain forecast model on new outcomes
+```
+
+### Overnight run
+
+```bash
+cargo run --release 2>&1 | tee var/logs/overnight_$(date +%Y-%m-%d).log
+```
+
+### Run one normal cycle
+
+```bash
+BOT_RUN_ONCE=true cargo run --quiet
+```
+
+### Run a safe live cycle with policy shadow
+
+```bash
+BOT_EXECUTION_MODE=live \
+BOT_RUN_SMOKE_TEST=true \
+BOT_RUN_ONCE=true \
+BOT_POLICY_MODE=shadow \
+BOT_MODEL_FORECAST_PATH=var/models/forecast/latest.json \
+BOT_MODEL_EXECUTION_PATH=var/models/execution/latest.json \
+BOT_FORECAST_SHADOW_ENABLED=true \
+BOT_EXECUTION_SHADOW_ENABLED=true \
+BOT_POLICY_SHADOW_ENABLED=true \
+cargo run --quiet
+```
+
+### Run research capture only
+
+```bash
+BOT_RUN_RESEARCH_CAPTURE_ONLY=true \
+BOT_RUN_ONCE=true \
+cargo run --quiet
+```
+
+### Run research paper capture only
+
+```bash
+BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY=true \
+BOT_RUN_ONCE=true \
+cargo run --quiet
+```
+
+### Backfill outcomes
+
+```bash
+BOT_RUN_OUTCOME_BACKFILL=true cargo run --quiet
+```
+
+### Build datasets
+
+```bash
+BOT_RUN_DATASET_BUILD=true cargo run --quiet
+```
+
+### Train forecast model
+
+```bash
+BOT_RUN_FORECAST_TRAIN=true cargo run --quiet
+```
+
+### Train execution model
+
+```bash
+BOT_RUN_EXECUTION_TRAIN=true cargo run --quiet
+```
+
+### Generate model report
+
+```bash
+BOT_RUN_MODEL_REPORT=true cargo run --quiet
+```
+
+### Generate policy report
+
+```bash
+BOT_RUN_POLICY_REPORT=true cargo run --quiet
+```
+
+### Generate research report
+
+```bash
+BOT_RUN_RESEARCH_REPORT=true cargo run --quiet
+```
+
+## Open Source and Contribution Rules
+
+If you contribute here, please follow these rules.
+
+### 1. Do not commit secrets
+
+Never commit:
+
+- `.env`
+- API keys
+- private keys
+- account identifiers that are not already intentionally public
+
+### 2. Treat `var/` as generated and potentially sensitive
+
+`var/` contains runtime artifacts, research logs, state, datasets, and models.
+
+Even when it does not include direct personal identifiers, it may expose:
+
+- strategy behavior
+- market coverage
+- timestamps
+- execution history
+- training data provenance
+
+Do not casually commit new `var/` artifacts. If examples are needed, prefer small sanitized fixtures.
+
+### 3. Preserve provenance
+
+Do not mix synthetic, paper, and live execution data without labeling it.
+
+Execution rows should continue to preserve source distinctions such as:
+
+- `bootstrap_synthetic`
+- `organic_paper`
+- `live_real`
+
+### 4. Shadow first
+
+New modeling or policy logic should be introduced in `shadow` before being allowed to control live decisions.
+
+### 5. Optimize for honest evaluation
+
+Do not judge success only by mark-to-mid or paper fill assumptions.
+
+Prefer:
+
+- realized fill behavior
+- explicit fill labels
+- explicit markout labels
+- time-based validation splits
+- clean comparisons to baseline behavior
+
+### 6. Avoid destructive cleanup of user data
+
+Generated data can still be valuable for research. Prefer:
+
+- `git rm --cached` over deleting local files
+- sanitized fixtures over broad purges
+- additive migration steps over irreversible cleanup
+
+### 7. Keep docs general
+
+Do not put machine-specific paths, personal hostnames, or local absolute paths in public-facing docs.
+
+## What This Project Is Not
+
+This is not yet:
+
+- a high-frequency market maker
+- a full order-book microstructure simulator
+- a deep-learning serving stack
+- a fully validated execution optimizer
+
+It is better understood as:
+
+- a solid Rust trading core
+- a growing research/data pipeline
+- an increasingly execution-aware modeling system under active development
+
+## Roadmap Docs
+
+- `docs/execution_aware_prediction_plan.md`
+  - broad implementation roadmap for the execution-aware stack
+- `docs/feature_catalog_step3.md`
+  - feature definitions for the current forecast and execution feature layer
+
+## License
+
+No explicit license file is currently included in the repository.
+
+That means outside users should not assume broad reuse rights until a license is added.
