@@ -137,6 +137,7 @@ That means:
   - replay utilities
 - `docs/`
   - project roadmap and feature catalog
+  - release workflow and operating guidance
 - `var/`
   - generated runtime, research, datasets, models, logs, and artifacts
 
@@ -650,6 +651,12 @@ python3 scripts/evaluate_shadow.py                           # forecast calibrat
 BOT_RUN_FORECAST_TRAIN=true cargo run --release --quiet      # retrain forecast model on new outcomes
 ```
 
+### Release preflight
+
+```bash
+scripts/release_check.sh
+```
+
 ### Operational profiles
 
 The project now includes stable entrypoint scripts for the main operating modes:
@@ -845,6 +852,8 @@ It is better understood as:
   - broad implementation roadmap for the execution-aware stack
 - `docs/feature_catalog_step3.md`
   - feature definitions for the current forecast and execution feature layer
+- `docs/release_process.md`
+  - branch, release, and promotion workflow
 
 ## License
 
