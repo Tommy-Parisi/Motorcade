@@ -802,7 +802,7 @@ fn enrichment_bias(e: &MarketEnrichment, ticker: &str) -> f64 {
             .or(e.crypto_sentiment_signal)
             .unwrap_or(0.0)
     };
-    raw_signal * 0.08
+    raw_signal * 0.02
 }
 
 #[derive(Debug, Serialize)]

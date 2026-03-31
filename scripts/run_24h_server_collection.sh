@@ -25,22 +25,26 @@ export BOT_CYCLE_SECONDS="600" # 10-minute cycles (144 per day)
 export BOT_CLAUDE_TRIGGER_MODE="on_heuristic_candidates"
 export BOT_VALUATION_MARKETS="30"      # Keep batches small to manage token count
 export BOT_CLAUDE_EVERY_N_CYCLES="1"   # Check every cycle, but only pay if heuristic likes it
+export BOT_VALUATION_CACHE_TTL_SECS="60" # Short cache to get more frequent re-valuations
 
-# --- Lowering the Bar for Data Density ---
-# Trigger Claude even on small perceived edges to grow the "smart" dataset.
-export BOT_MISPRICING_THRESHOLD="0.03" 
-export BOT_MIN_EDGE_PCT="0.03"
-export BOT_FALLBACK_MISPRICING_THRESHOLD="0.01"
-export BOT_MIN_CANDIDATES="5"
+# --- Maximising Data Variety (Lowering the Bar) ---
+# Trigger Claude and execution even on small perceived edges to grow the "smart" dataset.
+# Brutally honest truth: we need volume across verticals, even if noise increases.
+export BOT_MISPRICING_THRESHOLD="0.01" 
+export BOT_MIN_EDGE_PCT="0.01"
+export BOT_FALLBACK_MISPRICING_THRESHOLD="0.005"
+export BOT_MIN_CANDIDATES="10"
 
 # --- Scanning Strategy ---
-# Focus on liquid 24/7 verticals to ensure steady data flow.
+# Lower volume floor and increase spread limit to bring in Sports/Weather.
+export BOT_SCAN_MIN_VOLUME="100"
+export BOT_SCAN_MAX_SPREAD_CENTS="15.0"
 export BOT_SCAN_SERIES_ALLOWLIST="KXSILVERD,KXGOLDMON,KXBTCD,KXETHD,KXSOLD,KXXRPD,KXNASDAQ100MINY"
 export BOT_SCAN_TIER2_CATEGORIES="Sports,Crypto,Financials,Climate and Weather"
-export BOT_SCAN_MAX_TIER2_SERIES="30"
-export BOT_ENRICHMENT_MARKETS="40"
+export BOT_SCAN_MAX_TIER2_SERIES="40"
+export BOT_ENRICHMENT_MARKETS="60"
 
-echo "Starting 24/7 Server Collection Mode..."
+echo "Starting 24/7 Server Collection Mode (Permissive Data Mode)..."
 echo "Targeting Claude valuations on heuristic candidates every 10m."
 echo "Budgeted for ~\$3/day Claude usage."
 
