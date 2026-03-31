@@ -13,6 +13,10 @@ use crate::features::forecast::ForecastFeatureRow;
 pub const FORECAST_MODEL_SCHEMA_VERSION: &str = "v1";
 pub const FORECAST_MODEL_KIND: &str = "empirical_shrinkage_baseline";
 
+/// Half-life for training row time decay. Rows this many days old receive half the weight
+/// of today's rows. 90 days: week-old data still counts at ~95%, year-old at ~6%.
+pub const DECAY_HALF_LIFE_DAYS: f64 = 90.0;
+
 #[derive(Debug, Clone)]
 pub struct ForecastTrainingConfig {
     pub enabled: bool,
@@ -146,9 +150,13 @@ pub struct RateBucket {
 
 impl RateBucket {
     fn update(&mut self, outcome_yes: bool) {
-        self.total += 1.0;
+        self.update_weighted(outcome_yes, 1.0);
+    }
+
+    fn update_weighted(&mut self, outcome_yes: bool, weight: f64) {
+        self.total += weight;
         if outcome_yes {
-            self.positives += 1.0;
+            self.positives += weight;
         }
     }
 
@@ -227,10 +235,11 @@ impl ForecastModel {
             }
         }
 
-        let fair_prob_yes = (weighted_prob / weight_sum.max(0.0001)).clamp(0.001, 0.999);
+        let structural_prob = (weighted_prob / weight_sum.max(0.0001)).clamp(0.001, 0.999);
         let effective_n = self.effective_support(feature);
         let uncertainty = (1.0 / (effective_n + 1.0).sqrt()).clamp(0.01, 0.50);
         let confidence = (1.0 - uncertainty).clamp(0.0, 1.0);
+        let fair_prob_yes = self.market_anchored_prob(feature, structural_prob, confidence, global_mean);
 
         ForecastOutput {
             ticker: feature.ticker.clone(),
@@ -240,6 +249,32 @@ impl ForecastModel {
             model_version: self.artifact.model_version.clone(),
             feature_ts: feature.feature_ts,
         }
+    }
+
+    fn market_anchored_prob(
+        &self,
+        feature: &ForecastFeatureRow,
+        structural_prob: f64,
+        confidence: f64,
+        global_mean: f64,
+    ) -> f64 {
+        let Some(mid) = feature.mid_prob_yes else {
+            return structural_prob;
+        };
+        let structural_edge_vs_mid = structural_prob - mid;
+        let structural_edge_vs_global = structural_prob - global_mean;
+        let raw_correction = if structural_edge_vs_mid.abs() <= structural_edge_vs_global.abs() {
+            structural_edge_vs_mid
+        } else {
+            structural_edge_vs_global
+        };
+        // Lower cap prevents the model from applying maximum correction when it only has
+        // vertical-level bucket data. The constant 0.0277 delta (= 0.08 * max_strength)
+        // for all sports markets provided no discrimination between individual markets.
+        let max_correction = 0.04;
+        let correction_strength = (confidence * 0.35).clamp(0.05, 0.35);
+        (mid + raw_correction.clamp(-max_correction, max_correction) * correction_strength)
+            .clamp(0.001, 0.999)
     }
 
     fn lookup_bucket<'a>(
@@ -256,7 +291,12 @@ impl ForecastModel {
     }
 
     fn effective_support(&self, feature: &ForecastFeatureRow) -> f64 {
-        let mut total = self.artifact.global.total;
+        // Do NOT seed from global.total. The global bucket (350k+ rows) inflates confidence
+        // to ~99% for every prediction regardless of how much specific data we have, which
+        // causes correction_strength to always hit its maximum and produces a frozen constant
+        // delta for all markets in the same vertical. Global data informs the prior mean via
+        // posterior_mean(); it should not also claim near-certainty confidence.
+        let mut total = 0.0_f64;
         if let Some(bucket) = self.lookup_bucket(&self.artifact.vertical, &feature.vertical) {
             total += bucket.total * 0.5;
         }
@@ -425,12 +465,21 @@ pub fn record_shadow_outputs(
     Ok(())
 }
 
+/// Exponential time-decay weight for a training row. Recent rows get weight ≈ 1.0;
+/// rows `DECAY_HALF_LIFE_DAYS` old get weight ≈ 0.5; a year old get weight ≈ 0.06.
+fn decay_weight(feature_ts: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    let days_ago = (now - feature_ts).num_seconds().max(0) as f64 / 86_400.0;
+    let lambda = std::f64::consts::LN_2 / DECAY_HALF_LIFE_DAYS;
+    (-lambda * days_ago).exp()
+}
+
 fn train_artifact(
     train_rows: &[ForecastTrainingRow],
     validation_rows: usize,
     test_rows: usize,
 ) -> ForecastModelArtifact {
-    let model_version = format!("forecast-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let now = Utc::now();
+    let model_version = format!("forecast-{}", now.format("%Y%m%dT%H%M%SZ"));
     let mut global = RateBucket::default();
     let mut vertical = HashMap::new();
     let mut vertical_direction = HashMap::new();
@@ -441,28 +490,29 @@ fn train_artifact(
         let Some(outcome_yes) = row.label_outcome_yes else {
             continue;
         };
-        global.update(outcome_yes);
+        let w = decay_weight(row.feature.feature_ts, now);
+        global.update_weighted(outcome_yes, w);
         vertical
             .entry(row.feature.vertical.clone())
             .or_insert_with(RateBucket::default)
-            .update(outcome_yes);
+            .update_weighted(outcome_yes, w);
         if let Some(direction) = row.feature.threshold_direction.as_deref() {
             vertical_direction
                 .entry(format!("{}|{}", row.feature.vertical, direction))
                 .or_insert_with(RateBucket::default)
-                .update(outcome_yes);
+                .update_weighted(outcome_yes, w);
         }
         if let Some(entity) = row.feature.entity_primary.as_deref() {
             vertical_entity
                 .entry(format!("{}|{}", row.feature.vertical, normalize_key(entity)))
                 .or_insert_with(RateBucket::default)
-                .update(outcome_yes);
+                .update_weighted(outcome_yes, w);
         }
         if let Some(key) = threshold_bucket_key(&row.feature) {
             vertical_threshold
                 .entry(key)
                 .or_insert_with(RateBucket::default)
-                .update(outcome_yes);
+                .update_weighted(outcome_yes, w);
         }
     }
 
@@ -618,7 +668,7 @@ mod tests {
             label_resolution_status: "resolved".to_string(),
             feature: ForecastFeatureRow {
                 schema_version: "v1".to_string(),
-                feature_ts: Utc.timestamp_opt(1, 0).single().unwrap(),
+                feature_ts: Utc::now() - chrono::Duration::days(1),
                 ticker: ticker.to_string(),
                 title: "Will the high temp in Houston be >70?".to_string(),
                 subtitle: None,
@@ -782,5 +832,102 @@ mod tests {
         // loose uses the all-true weather bucket → higher probability than strict
         assert!(loose_out.fair_prob_yes > strict_out.fair_prob_yes,
             "loose={:.4} should > strict={:.4}", loose_out.fair_prob_yes, strict_out.fair_prob_yes);
+    }
+
+    #[test]
+    fn decay_weight_at_zero_days_is_one() {
+        let now = Utc::now();
+        let w = decay_weight(now, now);
+        assert!((w - 1.0).abs() < 1e-9, "weight at 0 days should be 1.0, got {w}");
+    }
+
+    #[test]
+    fn decay_weight_at_half_life_is_half() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::days(DECAY_HALF_LIFE_DAYS as i64);
+        let w = decay_weight(past, now);
+        assert!((w - 0.5).abs() < 0.01, "weight at half-life should be ~0.5, got {w}");
+    }
+
+    #[test]
+    fn decay_weight_at_double_half_life_is_quarter() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::days((DECAY_HALF_LIFE_DAYS * 2.0) as i64);
+        let w = decay_weight(past, now);
+        assert!((w - 0.25).abs() < 0.01, "weight at 2× half-life should be ~0.25, got {w}");
+    }
+
+    #[test]
+    fn decay_weight_future_timestamp_clamps_to_one() {
+        // Feature timestamps in the future (clock skew) should not produce weight > 1.
+        let now = Utc::now();
+        let future = now + chrono::Duration::days(10);
+        let w = decay_weight(future, now);
+        // num_seconds().max(0) clamps negative elapsed to 0 → exp(0) = 1.0
+        assert!((w - 1.0).abs() < 1e-9, "future timestamp should give weight 1.0, got {w}");
+    }
+
+    #[test]
+    fn train_artifact_downweights_old_rows() {
+        // One recent row resolving false, one 180-day-old row resolving true.
+        // With decay: old row weight ≈ 0.25 → global posterior should be well below 0.5.
+        let now = Utc::now();
+        let recent_ts = now - chrono::Duration::hours(1);
+        let old_ts = now - chrono::Duration::days(180);
+
+        let mut recent = sample_row("train", "R", "other", false);
+        recent.feature.feature_ts = recent_ts;
+
+        let mut old = sample_row("train", "O", "other", true);
+        old.feature.feature_ts = old_ts;
+
+        let rows = vec![recent, old];
+        let artifact = train_artifact(&rows, 0, 0);
+
+        // Without decay: 1 true + 1 false → global posterior_mean(0.5, 2.0) = (1+1)/(2+2) = 0.5
+        // With decay: recent weight ≈ 1.0 (false), old weight ≈ 0.25 (true)
+        //   positives ≈ 0.25, total ≈ 1.25 → posterior = (0.25 + 0.5*2) / (1.25 + 2) = 1.25/3.25 ≈ 0.385
+        let global_mean = artifact.global.posterior_mean(0.5, 2.0);
+        assert!(global_mean < 0.45,
+            "recent false should dominate old true with decay; global_mean={global_mean:.4}");
+    }
+
+    #[test]
+    fn effective_support_not_inflated_by_global_total() {
+        // Regression test: effective_support must NOT seed from global.total.
+        // Before the fix, with 350k global rows, confidence was always ~0.99 and
+        // delta was always max_correction * max_strength = 0.04 * 0.35 = 0.014,
+        // producing a frozen constant delta for every market in the same vertical.
+        //
+        // After the fix, a model trained on only a handful of rows should have
+        // meaningfully lower confidence than one trained on thousands.
+
+        // Small dataset: 4 sports rows
+        let mut small_rows = Vec::new();
+        for i in 0..4 {
+            small_rows.push(sample_row("train", &format!("S{i}"), "sports", i % 2 == 0));
+        }
+        let small_artifact = train_artifact(&small_rows, 0, 0);
+        let small_model = ForecastModel::from_artifact(small_artifact, 1);
+
+        // Large dataset: 400 sports rows
+        let mut large_rows = Vec::new();
+        for i in 0..400 {
+            large_rows.push(sample_row("train", &format!("L{i}"), "sports", i % 2 == 0));
+        }
+        let large_artifact = train_artifact(&large_rows, 0, 0);
+        let large_model = ForecastModel::from_artifact(large_artifact, 1);
+
+        let feat = sample_row("test", "X", "sports", true).feature;
+        let small_out = small_model.predict(&feat);
+        let large_out = large_model.predict(&feat);
+
+        // With the global-seed bug, both models produced near-identical confidence (≈0.99).
+        // After the fix, small_out.confidence should be noticeably lower than large_out.confidence.
+        assert!(
+            large_out.confidence > small_out.confidence,
+            "large model ({} rows) should have higher confidence than small ({} rows): large={:.4} small={:.4}",
+            400, 4, large_out.confidence, small_out.confidence
+        );
     }
 }

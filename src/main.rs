@@ -20,7 +20,7 @@ mod policy;
 mod replay;
 mod research;
 
-use data::market_enrichment::{EnrichmentConfig, MarketEnricher};
+use data::market_enrichment::{EnrichmentConfig, MarketEnricher, select_for_enrichment};
 use data::market_scanner::{KalshiMarketScanner, ScannerConfig};
 use datasets::builder::{DatasetBuildConfig, run_dataset_build};
 use execution::client::{ExchangeClient, KalshiClient};
@@ -320,6 +320,7 @@ fn validate_active_policy_requirements(
 
     validate_forecast_artifact_for_active(policy_config, forecast_model.artifact())?;
     validate_execution_artifact_for_active(policy_config, execution_model.artifact())?;
+    validate_shadow_calibration(policy_config)?;
     Ok(())
 }
 
@@ -373,6 +374,95 @@ fn validate_execution_artifact_for_active(
     Ok(())
 }
 
+fn validate_shadow_calibration(policy_config: &PolicyConfig) -> Result<(), String> {
+    let shadow_policy_dir = policy_config.shadow_root.join("policy");
+
+    let cutoff = (Utc::now() - chrono::Duration::days(policy_config.active_shadow_lookback_days))
+        .date_naive();
+
+    let mut total_decisions = 0usize;
+    let mut should_trade_count = 0usize;
+    let mut erpnl_sum = 0.0f64;
+
+    let entries = match std::fs::read_dir(&shadow_policy_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "shadow policy directory not found: {}; run in shadow mode first",
+                shadow_policy_dir.display()
+            ));
+        }
+        Err(e) => return Err(format!("cannot read shadow dir: {e}")),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return Err(format!("shadow dir entry error: {e}")),
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(day_str) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(day) = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d") else {
+            continue;
+        };
+        if day < cutoff {
+            continue;
+        }
+        let file_path = path.join("policy_shadow.jsonl");
+        let text = match std::fs::read_to_string(&file_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot read shadow file: {e}")),
+        };
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            total_decisions += 1;
+            let should_trade = v.get("should_trade").and_then(|x| x.as_bool()).unwrap_or(false);
+            if should_trade {
+                let erpnl = v
+                    .get("expected_realized_pnl")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                should_trade_count += 1;
+                erpnl_sum += erpnl;
+            }
+        }
+    }
+
+    if total_decisions < policy_config.active_min_shadow_decisions {
+        return Err(format!(
+            "active mode requires at least {} shadow decisions in the last {} days (found {}); \
+             run in shadow mode first",
+            policy_config.active_min_shadow_decisions,
+            policy_config.active_shadow_lookback_days,
+            total_decisions,
+        ));
+    }
+
+    if should_trade_count > 0 {
+        let mean_erpnl = erpnl_sum / should_trade_count as f64;
+        if mean_erpnl < policy_config.active_min_shadow_mean_erpnl {
+            return Err(format!(
+                "shadow mean expected_realized_pnl ({:.2}) is below threshold ({:.2}); \
+                 recalibrate before enabling active mode",
+                mean_erpnl, policy_config.active_min_shadow_mean_erpnl,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_research_capture_mode() -> Result<(), execution::types::ExecutionError> {
     let scanner = KalshiMarketScanner::new(ScannerConfig::default());
     let enricher = MarketEnricher::new(EnrichmentConfig::default());
@@ -412,16 +502,24 @@ async fn run_research_capture_cycle(
     println!("research capture cycle #{} starting", cycle_number);
 
     let scan_trace = scanner.scan_snapshot_with_trace().await?;
+
+    let selected = scanner.select_for_valuation(scan_trace.final_markets.clone());
+    let to_enrich = select_for_enrichment(&selected, enrichment_limit);
+    let enriched = enricher.enrich_batch(&to_enrich).await?;
+
+    let mut enrichment_by_ticker = std::collections::HashMap::new();
+    for e in &enriched {
+        enrichment_by_ticker.insert(e.ticker.clone(), e.clone());
+    }
+
+    // Record after enrichment so finance_price_signal is included
     record_scan_trace(
         research_capture,
         &cycle_id,
         &scan_trace.snapshot_markets,
         &scan_trace,
+        Some(&enrichment_by_ticker),
     )?;
-
-    let selected = scanner.select_for_valuation(scan_trace.final_markets.clone());
-    let enrich_count = enrichment_limit.min(selected.len());
-    let enriched = enricher.enrich_batch(&selected[..enrich_count]).await?;
 
     println!(
         "research capture cycle complete: selected_markets={} enriched_markets={} research_dir={}",
@@ -501,19 +599,21 @@ async fn run_cycle(runtime: &BotRuntime) {
             return;
         }
     };
-    if let Err(err) = record_scan_trace(
-        &runtime.research_capture,
-        &cycle_id,
-        &scan_trace.snapshot_markets,
-        &scan_trace,
-    ) {
-        eprintln!("research capture warning (market_state): {err}");
-    }
     let scanned = scan_trace.final_markets.clone();
     log_position_marks_from_journal(&scanned);
     let selected = runtime.scanner.select_for_valuation(scanned);
     if selected.is_empty() {
         eprintln!("no markets selected for valuation");
+        // Still record scan trace (no enrichment available)
+        if let Err(err) = record_scan_trace(
+            &runtime.research_capture,
+            &cycle_id,
+            &scan_trace.snapshot_markets,
+            &scan_trace,
+            None,
+        ) {
+            eprintln!("research capture warning (market_state): {err}");
+        }
         persist_cycle_artifact(CycleArtifact {
             started_at,
             finished_at: Utc::now(),
@@ -531,11 +631,21 @@ async fn run_cycle(runtime: &BotRuntime) {
     }
     println!("selected {} markets for valuation", selected.len());
 
-    let enrich_count = runtime.enrichment_limit.min(selected.len());
-    let enrichments = match runtime.enricher.enrich_batch(&selected[..enrich_count]).await {
+    let to_enrich = select_for_enrichment(&selected, runtime.enrichment_limit);
+    let enrichments = match runtime.enricher.enrich_batch(&to_enrich).await {
         Ok(v) => v,
         Err(err) => {
             eprintln!("enrichment failed: {err}");
+            // Record scan trace without enrichment before bailing out
+            if let Err(e) = record_scan_trace(
+                &runtime.research_capture,
+                &cycle_id,
+                &scan_trace.snapshot_markets,
+                &scan_trace,
+                None,
+            ) {
+                eprintln!("research capture warning (market_state): {e}");
+            }
             persist_cycle_artifact(CycleArtifact {
                 started_at,
                 finished_at: Utc::now(),
@@ -561,6 +671,17 @@ async fn run_cycle(runtime: &BotRuntime) {
     let mut enrichment_by_ticker = std::collections::HashMap::new();
     for e in enrichments {
         enrichment_by_ticker.insert(e.ticker.clone(), e);
+    }
+
+    // Record market state after enrichment so finance_price_signal is captured
+    if let Err(err) = record_scan_trace(
+        &runtime.research_capture,
+        &cycle_id,
+        &scan_trace.snapshot_markets,
+        &scan_trace,
+        Some(&enrichment_by_ticker),
+    ) {
+        eprintln!("research capture warning (market_state): {err}");
     }
 
     let valuation_limit = runtime.valuation_limit.min(selected.len());
@@ -1076,6 +1197,7 @@ async fn run_cycle(runtime: &BotRuntime) {
             c.observed_price = decision.limit_price;
             c.edge_pct = decision.expected_realized_pnl.max(0.0) / 100.0;
             c.confidence = decision.expected_fill_prob.clamp(0.0, 1.0);
+            c.fair_price = decision.chosen_fair_price;
             c.rationale = format!(
                 "{} [policy_rank tif={:?} erpnl={:.4}]",
                 c.rationale, decision.time_in_force, decision.expected_realized_pnl
@@ -1558,7 +1680,7 @@ fn enrichment_market_limit_from_env() -> usize {
     std::env::var("BOT_ENRICHMENT_MARKETS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(25)
+        .unwrap_or(100)
 }
 
 fn bankroll_from_env() -> f64 {
@@ -1935,6 +2057,11 @@ fn order_key(outcome_id: &str, side: execution::types::Side) -> String {
     format!("{}:{:?}", outcome_id.to_ascii_lowercase(), side)
 }
 
+/// Flat edge bump used when the model is unavailable and a heuristic candidate
+/// must be constructed. Exposed as a named constant so the value is easy to find
+/// and adjust without grepping for magic numbers.
+const HEURISTIC_EDGE_FALLBACK: f64 = 0.03;
+
 fn build_forced_test_candidate(
     selected: &[data::market_scanner::ScannedMarket],
     valuations: &[MarketValuation],
@@ -1942,7 +2069,7 @@ fn build_forced_test_candidate(
     if let Some(v) = valuations.first() {
         let observed_yes = v.market_mid_prob_yes.clamp(0.01, 0.99);
         if observed_yes <= 0.95 {
-            let fair = (observed_yes + 0.03).clamp(0.01, 0.99);
+            let fair = (observed_yes + HEURISTIC_EDGE_FALLBACK).clamp(0.01, 0.99);
             return Some(CandidateTrade {
                 ticker: v.ticker.clone(),
                 side: execution::types::Side::Buy,
@@ -1955,7 +2082,7 @@ fn build_forced_test_candidate(
             });
         }
         let observed_no = (1.0 - observed_yes).clamp(0.01, 0.99);
-        let fair_no = (observed_no + 0.03).clamp(0.01, 0.99);
+        let fair_no = (observed_no + HEURISTIC_EDGE_FALLBACK).clamp(0.01, 0.99);
         return Some(CandidateTrade {
             ticker: v.ticker.clone(),
             side: execution::types::Side::Buy,
@@ -1970,7 +2097,7 @@ fn build_forced_test_candidate(
 
     let first = selected.first()?;
     let observed_yes = midpoint_prob_from_market(first)?;
-    let fair_yes = (observed_yes + 0.03).clamp(0.01, 0.99);
+    let fair_yes = (observed_yes + HEURISTIC_EDGE_FALLBACK).clamp(0.01, 0.99);
     Some(CandidateTrade {
         ticker: first.ticker.clone(),
         side: execution::types::Side::Buy,
@@ -2228,6 +2355,7 @@ mod tests {
             shadow_enabled: true,
             shadow_root: PathBuf::from("/tmp"),
             min_expected_realized_pnl: 0.0,
+            markout_veto_threshold_bps: -300.0,
             max_actions_per_candidate: 4,
             default_legacy_fallback: true,
             active_max_model_age_hours: 24 * 14,
@@ -2235,7 +2363,64 @@ mod tests {
             active_min_execution_train_rows: 100,
             active_min_execution_live_real_rows: 25,
             active_require_live_real: true,
+            active_min_shadow_decisions: 50,
+            active_shadow_lookback_days: 7,
+            active_min_shadow_mean_erpnl: -200.0,
         }
+    }
+
+    fn make_policy_config_for_shadow_test(shadow_root: &std::path::Path) -> PolicyConfig {
+        PolicyConfig {
+            shadow_root: shadow_root.to_path_buf(),
+            active_require_live_real: false,
+            active_min_shadow_decisions: 2,
+            active_shadow_lookback_days: 30,
+            ..active_policy_config()
+        }
+    }
+
+    fn write_shadow_records(dir: &std::path::Path, records: &[(&str, bool, f64)]) {
+        use std::io::Write;
+        let day_dir = dir.join("policy").join("2026-03-30");
+        fs::create_dir_all(&day_dir).unwrap();
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(day_dir.join("policy_shadow.jsonl"))
+            .unwrap();
+        for (cycle_id, should_trade, erpnl) in records {
+            let line = format!(
+                r#"{{"cycle_id":"{cycle_id}","recorded_at":"2026-03-30T00:00:00Z","ticker":"KXNBA-X","outcome_id":"yes","legacy_edge_pct":0.1,"legacy_confidence":0.9,"chosen_tif":"Gtc","chosen_limit_price":0.5,"should_trade":{should_trade},"size_multiplier":1.0,"expected_fill_prob":0.5,"expected_gross_edge":0.1,"expected_realized_pnl":{erpnl},"rejection_reason":null,"rationale":"test"}}"#
+            );
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
+    #[test]
+    fn shadow_gate_passes_with_sufficient_data() {
+        let dir = tempdir().unwrap();
+        write_shadow_records(dir.path(), &[("c1", true, 5.0), ("c2", true, 3.0), ("c3", false, 0.0)]);
+        let cfg = make_policy_config_for_shadow_test(dir.path());
+        assert!(validate_shadow_calibration(&cfg).is_ok());
+    }
+
+    #[test]
+    fn shadow_gate_fails_too_few_decisions() {
+        let dir = tempdir().unwrap();
+        write_shadow_records(dir.path(), &[("c1", true, 5.0)]);
+        let mut cfg = make_policy_config_for_shadow_test(dir.path());
+        cfg.active_min_shadow_decisions = 5;
+        let err = validate_shadow_calibration(&cfg).unwrap_err();
+        assert!(err.contains("shadow decisions"), "{err}");
+    }
+
+    #[test]
+    fn shadow_gate_fails_low_mean_erpnl() {
+        let dir = tempdir().unwrap();
+        write_shadow_records(dir.path(), &[("c1", true, -500.0), ("c2", true, -600.0), ("c3", true, -400.0)]);
+        let cfg = make_policy_config_for_shadow_test(dir.path());
+        let err = validate_shadow_calibration(&cfg).unwrap_err();
+        assert!(err.contains("below threshold"), "{err}");
     }
 
     fn good_forecast_model() -> ForecastModel {
@@ -2273,6 +2458,7 @@ mod tests {
                 included_source_classes: vec!["organic_paper".to_string(), "live_real".to_string()],
                 bootstrap_rows: 0,
                 organic_paper_rows: 200,
+                retroactive_synthetic_rows: 0,
                 live_real_rows,
                 feature_schema_version: "v1".to_string(),
                 metrics: ExecutionModelMetrics::default(),
@@ -2286,9 +2472,21 @@ mod tests {
         )
     }
 
+    fn active_policy_config_with_shadow(shadow_root: &std::path::Path) -> PolicyConfig {
+        PolicyConfig {
+            shadow_root: shadow_root.to_path_buf(),
+            active_require_live_real: true,
+            active_min_shadow_decisions: 0,
+            ..active_policy_config()
+        }
+    }
+
     #[test]
     fn active_policy_validation_rejects_insufficient_live_real_rows() {
-        let cfg = active_policy_config();
+        let dir = tempdir().unwrap();
+        // Create empty policy dir so shadow gate passes (min decisions = 0)
+        fs::create_dir_all(dir.path().join("policy")).unwrap();
+        let cfg = active_policy_config_with_shadow(dir.path());
         let forecast = good_forecast_model();
         let execution = execution_model_with_live_rows(0);
 
@@ -2299,7 +2497,9 @@ mod tests {
 
     #[test]
     fn active_policy_validation_accepts_sufficient_models() {
-        let cfg = active_policy_config();
+        let dir = tempdir().unwrap();
+        write_shadow_records(dir.path(), &[("c1", true, 5.0), ("c2", true, 3.0)]);
+        let cfg = active_policy_config_with_shadow(dir.path());
         let forecast = good_forecast_model();
         let execution = execution_model_with_live_rows(50);
 

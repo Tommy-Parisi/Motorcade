@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use crate::data::market_enrichment::MarketEnrichment;
 use crate::data::market_scanner::ScannedMarket;
 use crate::execution::types::{ExecutionError, Side, TradeSignal};
+use crate::features::forecast::extract_threshold_from_ticker;
 
 #[derive(Debug, Clone)]
 pub struct ValuationConfig {
@@ -321,6 +322,21 @@ impl ClaudeValuationEngine {
         let mut out = Vec::new();
         let total_cost_prob = (self.cfg.fee_bps + self.cfg.slippage_bps) / 10_000.0;
         for v in valuations {
+            // Skip markets where the price has converged to near-certainty. These are markets
+            // that have already effectively resolved (live scores, in-game events) — the price
+            // is correct and any apparent edge is an artefact of the model lagging behind.
+            // YES bid ≥ 90¢ → market thinks YES is near-certain; no real NO edge available.
+            // YES ask ≤ 10¢ → market thinks NO is near-certain; no real YES edge available.
+            // The mid_prob_yes guards catch the same condition when bid/ask are absent (None),
+            // preventing near-zero observed prices that the clamp would otherwise mask.
+            if v.yes_bid_cents.map(|b| b >= 90.0).unwrap_or(false)
+                || v.yes_ask_cents.map(|a| a <= 10.0).unwrap_or(false)
+                || v.market_mid_prob_yes >= 0.90
+                || v.market_mid_prob_yes <= 0.10
+            {
+                continue;
+            }
+
             // Use actual ask/bid for edge — paying mid is not achievable with IOC.
             // YES buy: edge = fair - ask. NO buy: edge = (1-fair) - (1-bid) = bid - fair... wait,
             // NO ask = (100 - yes_bid) / 100, so NO edge = (1-fair) - no_ask.
@@ -569,7 +585,7 @@ impl ClaudeValuationEngine {
                 let enrich_bias = i
                     .enrichment
                     .as_ref()
-                    .map(enrichment_bias)
+                    .map(|e| enrichment_bias(e, &i.market.ticker))
                     .unwrap_or(0.0)
                     .clamp(-0.15, 0.15);
                 let fair = (mid + enrich_bias).clamp(0.01, 0.99);
@@ -594,7 +610,7 @@ impl ClaudeValuationEngine {
         let enrich = i
             .enrichment
             .as_ref()
-            .map(enrichment_bias)
+            .map(|e| enrichment_bias(e, &i.market.ticker))
             .unwrap_or(0.0);
         format!(
             "{}|{:.4}|{:.1}|{:.4}",
@@ -720,6 +736,7 @@ fn extract_outer_json_array(s: &str) -> Option<String> {
 }
 
 fn build_prompt(inputs: &[ValuationInput], max_chars: usize) -> String {
+    let now = chrono::Utc::now();
     let mut prompt = String::from(
         "For each market, estimate fair_prob_yes in [0,1], confidence in [0,1], and short rationale.\nReturn ONLY JSON array of objects: {ticker, fair_prob_yes, confidence, rationale}\nMarkets:\n",
     );
@@ -728,11 +745,22 @@ fn build_prompt(inputs: &[ValuationInput], max_chars: usize) -> String {
         let enrich = i
             .enrichment
             .as_ref()
-            .map(enrichment_bias)
+            .map(|e| enrichment_bias(e, &i.market.ticker))
             .unwrap_or(0.0);
+        let spread = i.market.spread_cents().map(|s| format!("{:.1}c", s)).unwrap_or_else(|| "?".to_string());
+        let ttc = i.market.close_time.map(|c| {
+            let hours = (c - now).num_minutes() as f64 / 60.0;
+            if hours < 1.0 {
+                format!("{:.0}m", hours * 60.0)
+            } else if hours < 48.0 {
+                format!("{:.1}h", hours)
+            } else {
+                format!("{:.1}d", hours / 24.0)
+            }
+        }).unwrap_or_else(|| "?".to_string());
         let line = format!(
-            "- ticker={} title={} mid_prob_yes={:.4} volume={:.1} enrich_bias={:.4}\n",
-            i.market.ticker, i.market.title, mid, i.market.volume, enrich
+            "- ticker={} title={} mid={:.4} spread={} ttc={} vol={:.0} enrich={:.4}\n",
+            i.market.ticker, i.market.title, mid, spread, ttc, i.market.volume, enrich
         );
         if prompt.len() + line.len() > max_chars {
             break;
@@ -748,12 +776,33 @@ fn market_mid_prob_yes(market: &ScannedMarket) -> Option<f64> {
     Some(((bid + ask) / 2.0 / 100.0).clamp(0.01, 0.99))
 }
 
-fn enrichment_bias(e: &MarketEnrichment) -> f64 {
-    e.weather_signal
-        .or(e.sports_injury_signal)
-        .or(e.crypto_sentiment_signal)
-        .unwrap_or(0.0)
-        * 0.08
+/// Converts an enrichment signal into an additive probability bias in roughly [-0.08, +0.08].
+///
+/// For weather: `weather_signal` is raw °F from NOAA. We normalize it relative to the
+/// market-specific threshold extracted from the ticker (e.g. "will high exceed 55°F?").
+///   signal = (forecast_temp - threshold) / 15.0  clamped to [-1, 1]
+/// A forecast 15°F above the threshold → +1.0 → +0.08 probability bias toward YES.
+/// If no threshold can be extracted the weather signal contributes nothing (ambiguous direction).
+///
+/// Sports/crypto signals are already in [-1, 1] from their respective feeds.
+fn enrichment_bias(e: &MarketEnrichment, ticker: &str) -> f64 {
+    let raw_signal = if let Some(temp) = e.weather_signal {
+        match extract_threshold_from_ticker(ticker) {
+            Some(threshold) => ((temp - threshold) / 15.0).clamp(-1.0, 1.0),
+            None => 0.0, // without a threshold we can't tell if temp is good or bad for YES
+        }
+    } else {
+        // For crypto: prefer threshold-relative price signal (more specific than sentiment).
+        // For esports: use win-probability signal when available.
+        // Fall back through the chain to 0.0 when nothing is configured.
+        e.sports_injury_signal
+            .or(e.esports_signal)
+            .or(e.finance_price_signal)
+            .or(e.crypto_price_signal)
+            .or(e.crypto_sentiment_signal)
+            .unwrap_or(0.0)
+    };
+    raw_signal * 0.08
 }
 
 #[derive(Debug, Serialize)]
@@ -1088,5 +1137,169 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].outcome_id, "yes");
         assert!((candidates[0].observed_price - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn converged_yes_bid_suppresses_candidate() {
+        // YES bid=99 → market near-certain YES; any apparent NO edge is spurious.
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        // fair=0.58, NO ask=(100-99)/100=0.01 → raw NO edge = 0.42 − huge apparent edge
+        let vals = vec![make_valuation(0.58, Some(100.0), Some(99.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert!(candidates.is_empty(), "converged market (bid=99) should produce no candidates");
+    }
+
+    #[test]
+    fn converged_yes_ask_suppresses_candidate() {
+        // YES ask=1 → market near-certain NO; any apparent YES edge is spurious.
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        let vals = vec![make_valuation(0.58, Some(1.0), Some(0.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert!(candidates.is_empty(), "converged market (ask=1) should produce no candidates");
+    }
+
+    #[test]
+    fn non_converged_market_still_produces_candidate() {
+        // YES bid=68, ask=72 → normal open market; should still generate candidates when edge > threshold.
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+        // fair=0.82, ask=0.72 → YES edge=0.10 > 0.08
+        let vals = vec![make_valuation(0.82, Some(72.0), Some(68.0))];
+        let candidates = engine.generate_candidates(&vals);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].outcome_id, "yes");
+    }
+
+    #[test]
+    fn converged_mid_without_bid_ask_suppresses_candidate() {
+        // When bid/ask are None the clamp on no_ask hides the near-zero price, so we gate on
+        // market_mid_prob_yes directly. mid=0.97 → no real NO edge; mid=0.03 → no real YES edge.
+        let cfg = ValuationConfig {
+            mispricing_threshold: 0.08,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+            ..ValuationConfig::default()
+        };
+        let engine = ClaudeValuationEngine::new(cfg);
+
+        // High mid (near-certain YES) with no bid/ask: apparent NO edge is huge but spurious.
+        let val_high = MarketValuation {
+            ticker: "KXHIGH".to_string(),
+            fair_prob_yes: 0.38, // heuristic disagrees, but market is near-certain
+            market_mid_prob_yes: 0.97,
+            yes_ask_cents: None,
+            yes_bid_cents: None,
+            market_volume: 5_000.0,
+            spread_cents: None,
+            confidence: 0.8,
+            rationale: "test".to_string(),
+            stale_after: Utc::now(),
+        };
+        let candidates = engine.generate_candidates(&[val_high]);
+        assert!(
+            candidates.is_empty(),
+            "converged market (mid=0.97, no bid/ask) should produce no candidates"
+        );
+
+        // Low mid (near-certain NO) with no bid/ask: apparent YES edge is huge but spurious.
+        let val_low = MarketValuation {
+            ticker: "KXLOW".to_string(),
+            fair_prob_yes: 0.62,
+            market_mid_prob_yes: 0.03,
+            yes_ask_cents: None,
+            yes_bid_cents: None,
+            market_volume: 5_000.0,
+            spread_cents: None,
+            confidence: 0.8,
+            rationale: "test".to_string(),
+            stale_after: Utc::now(),
+        };
+        let candidates = engine.generate_candidates(&[val_low]);
+        assert!(
+            candidates.is_empty(),
+            "converged market (mid=0.03, no bid/ask) should produce no candidates"
+        );
+    }
+
+    fn weather_enrichment(temp_f: f64) -> MarketEnrichment {
+        crate::data::market_enrichment::MarketEnrichment {
+            ticker: "KXHIGH".to_string(),
+            vertical: crate::data::market_enrichment::MarketVertical::Weather,
+            weather_signal: Some(temp_f),
+            sports_injury_signal: None,
+            crypto_sentiment_signal: None,
+            crypto_price_signal: None,
+            esports_signal: None,
+            finance_price_signal: None,
+            generated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn enrichment_bias_weather_forecast_above_threshold() {
+        // ticker threshold = 55°F, forecast = 70°F → (70-55)/15 = 1.0 clamped → bias = +0.08
+        let e = weather_enrichment(70.0);
+        let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
+        assert!((bias - 0.08).abs() < 1e-9, "bias={bias}");
+    }
+
+    #[test]
+    fn enrichment_bias_weather_forecast_below_threshold() {
+        // forecast = 40°F, threshold = 55°F → (40-55)/15 = -1.0 clamped → bias = -0.08
+        let e = weather_enrichment(40.0);
+        let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
+        assert!((bias - (-0.08)).abs() < 1e-9, "bias={bias}");
+    }
+
+    #[test]
+    fn enrichment_bias_weather_partial_signal() {
+        // forecast = 62°F, threshold = 55°F → (62-55)/15 = 0.4667 → bias ≈ 0.0373
+        let e = weather_enrichment(62.0);
+        let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
+        let expected = (7.0_f64 / 15.0) * 0.08;
+        assert!((bias - expected).abs() < 1e-9, "bias={bias} expected={expected}");
+    }
+
+    #[test]
+    fn enrichment_bias_weather_no_threshold_in_ticker_returns_zero() {
+        // No -T segment → can't determine direction → no bias
+        let e = weather_enrichment(85.0);
+        let bias = enrichment_bias(&e, "KXWEATHER-NYC");
+        assert_eq!(bias, 0.0, "bias should be 0 when no threshold can be extracted");
+    }
+
+    #[test]
+    fn enrichment_bias_sports_injury_unchanged() {
+        // Sports signal is already in [-1, 1]; just scaled by 0.08
+        let e = crate::data::market_enrichment::MarketEnrichment {
+            ticker: "KXNBA".to_string(),
+            vertical: crate::data::market_enrichment::MarketVertical::Sports,
+            weather_signal: None,
+            sports_injury_signal: Some(0.5),
+            crypto_sentiment_signal: None,
+            crypto_price_signal: None,
+            esports_signal: None,
+            finance_price_signal: None,
+            generated_at: Utc::now(),
+        };
+        let bias = enrichment_bias(&e, "KXNBAGAME-26MAR24BOSNYC-BOS");
+        assert!((bias - 0.04).abs() < 1e-9, "bias={bias}");
     }
 }

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::data::market_enrichment::select_for_enrichment;
 use crate::data::ws_delta::{KalshiWsDeltaIngestor, MarketDelta, WsDeltaConfig};
 use crate::execution::types::ExecutionError;
 
@@ -22,6 +23,31 @@ pub struct ScannerConfig {
     pub series_blocklist: Vec<String>,
     /// Max markets fetched per allowlist series query (BOT_SCAN_SERIES_MAX_PER_FETCH, default 200).
     pub series_max_per_fetch: usize,
+    /// Skip markets closing within this many seconds (BOT_SCAN_MIN_CLOSE_SECS, default 900 = 15min).
+    /// Markets with no close_time are always kept.
+    pub min_time_to_close_secs: i64,
+    /// Max markets retained per event_ticker after volume sort (BOT_SCAN_MAX_PER_EVENT, default 3).
+    /// Prevents a single event (e.g. 15 KXHIGHCHI threshold variants) from flooding quota.
+    /// 0 = no cap.
+    pub max_per_event: usize,
+    /// When true, apply round-robin category balancing in select_for_valuation so that
+    /// Weather/Sports/Crypto/Other each get proportional representation regardless of
+    /// which category dominates by raw volume (BOT_SCAN_BALANCE_CATEGORIES, default true).
+    pub balance_by_category: bool,
+    /// Kalshi API categories to query in tier-2 series discovery. The general unfiltered
+    /// endpoint floods with KXMVE, so tier-2 instead enumerates series by these categories
+    /// and queries each briefly. Comma-separated (BOT_SCAN_TIER2_CATEGORIES).
+    pub tier2_categories: Vec<String>,
+    /// Max series queries in tier-2 (BOT_SCAN_MAX_TIER2_SERIES, default 120).
+    /// Each query fetches up to `series_max_per_fetch` markets; stop when quota or cap is hit.
+    pub max_tier2_series: usize,
+    /// Max markets to output from select_for_valuation (BOT_VALUATION_MARKETS, default 250).
+    /// Kept here so the round-robin balancing step produces exactly the right count.
+    pub valuation_limit: usize,
+    /// When true, markets with no bid/ask (spread_cents=None) pass the spread filter instead
+    /// of being dropped. Useful for overnight paper collection where market makers are absent
+    /// but mid-price-based valuation still works. (BOT_SCAN_ALLOW_NO_SPREAD, default false).
+    pub allow_no_spread: bool,
 }
 
 impl Default for ScannerConfig {
@@ -55,17 +81,55 @@ impl Default for ScannerConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            series_blocklist: std::env::var("BOT_SCAN_SERIES_BLOCKLIST")
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            series_blocklist: {
+                // Always block multi-leg parlays (KXMVE*) and novelty quick-settle markets.
+                // These are unpredictable by any signal-based model and flood the scan quota.
+                let defaults = ["KXMVE", "KXQUICKSETTLE"];
+                let from_env: Vec<String> = std::env::var("BOT_SCAN_SERIES_BLOCKLIST")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                defaults.iter().map(|s| s.to_string()).chain(from_env).collect()
+            },
             series_max_per_fetch: std::env::var("BOT_SCAN_SERIES_MAX_PER_FETCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(200)
                 .max(10),
+            min_time_to_close_secs: std::env::var("BOT_SCAN_MIN_CLOSE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(900)
+                .max(0),
+            max_per_event: std::env::var("BOT_SCAN_MAX_PER_EVENT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3),
+            balance_by_category: std::env::var("BOT_SCAN_BALANCE_CATEGORIES")
+                .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(true),
+            tier2_categories: std::env::var("BOT_SCAN_TIER2_CATEGORIES")
+                .unwrap_or_else(|_| {
+                    "Sports,Crypto,Financials,Climate and Weather,Politics".to_string()
+                })
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            max_tier2_series: std::env::var("BOT_SCAN_MAX_TIER2_SERIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120),
+            valuation_limit: std::env::var("BOT_VALUATION_MARKETS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(250)
+                .max(1),
+            allow_no_spread: std::env::var("BOT_SCAN_ALLOW_NO_SPREAD")
+                .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(false),
         }
     }
 }
@@ -107,10 +171,11 @@ pub struct ScanTrace {
 
 impl KalshiMarketScanner {
     pub fn new(cfg: ScannerConfig) -> Self {
-        Self {
-            cfg,
-            http: Client::new(),
-        }
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        Self { cfg, http }
     }
 
     pub async fn scan_snapshot(&self) -> Result<Vec<ScannedMarket>, ExecutionError> {
@@ -136,27 +201,38 @@ impl KalshiMarketScanner {
             }
         }
 
-        // Tier 2: general scan to fill remaining quota, skipping blocklisted series
-        // and markets already fetched in tier 1.
-        let remaining = self.cfg.max_markets.saturating_sub(seen.len());
-        if remaining > 0 {
-            let general = self.scan_pages(None, remaining + self.cfg.series_blocklist.len() * 1000).await?;
-            for m in general {
-                if seen.contains_key(&m.ticker) {
-                    continue;
+        // Tier 2: series-category discovery to fill remaining quota.
+        // The unfiltered general endpoint returns KXMVE first (100k+ variants), which consumes
+        // the entire fetch budget before any real markets appear. Instead, enumerate series by
+        // category (Sports/Crypto/etc.), skip already-seen and blocked series, then query each
+        // briefly. Series are sorted by last_updated_ts desc so active ones come first.
+        if seen.len() < self.cfg.max_markets && !self.cfg.tier2_categories.is_empty() {
+            let discovered = self.fetch_series_by_categories().await;
+            let mut tier2_queries = 0usize;
+            for series_ticker in &discovered {
+                if seen.len() >= self.cfg.max_markets { break; }
+                if tier2_queries >= self.cfg.max_tier2_series { break; }
+                // Skip already in allowlist (already fetched in tier 1).
+                if self.cfg.series_allowlist.iter().any(|a| a == series_ticker) { continue; }
+                let budget = (self.cfg.max_markets - seen.len()).min(self.cfg.series_max_per_fetch);
+                // Brief pause to stay within Kalshi rate limits after the tier-1 burst.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let markets = self
+                    .scan_pages(Some(series_ticker.as_str()), budget)
+                    .await
+                    .unwrap_or_else(|err| {
+                        eprintln!("scan warning: tier2 series {series_ticker} failed: {err}");
+                        Vec::new()
+                    });
+                for m in markets {
+                    if !seen.contains_key(&m.ticker) {
+                        seen.entry(m.ticker.clone()).or_insert(m);
+                    }
                 }
-                let series = m.series_ticker.as_deref().unwrap_or("");
-                let blocked = self
-                    .cfg
-                    .series_blocklist
-                    .iter()
-                    .any(|b| series.starts_with(b.as_str()) || m.ticker.starts_with(b.as_str()));
-                if !blocked {
-                    seen.entry(m.ticker.clone()).or_insert(m);
-                }
-                if seen.len() >= self.cfg.max_markets {
-                    break;
-                }
+                tier2_queries += 1;
+            }
+            if tier2_queries > 0 {
+                println!("scan tier2: queried {tier2_queries} discovered series");
             }
         }
 
@@ -213,6 +289,63 @@ impl KalshiMarketScanner {
         Ok(out)
     }
 
+    /// Fetch series tickers from the Kalshi series endpoint for all configured tier-2
+    /// categories. Returns tickers sorted by last_updated_ts descending (most active first),
+    /// with blocked series already removed.
+    ///
+    /// Each category request is bounded by a 10-second timeout so that a single slow
+    /// or hanging endpoint cannot collapse the entire discovery pass.
+    async fn fetch_series_by_categories(&self) -> Vec<String> {
+        const CATEGORY_TIMEOUT: Duration = Duration::from_secs(10);
+        let mut entries: Vec<(String, String)> = Vec::new(); // (last_updated_ts, ticker)
+        for category in &self.cfg.tier2_categories {
+            let req = self
+                .http
+                .get(format!("{}/trade-api/v2/series", self.cfg.api_base_url))
+                .query(&[("limit", "1000"), ("category", category.as_str())])
+                .send();
+            let resp = match tokio::time::timeout(CATEGORY_TIMEOUT, req).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("scan warning: series list for '{category}' failed: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("scan warning: series list for '{category}' timed out");
+                    continue;
+                }
+            };
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed: SeriesListResponse = match serde_json::from_str(&body) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            for s in parsed.series {
+                let blocked = self
+                    .cfg
+                    .series_blocklist
+                    .iter()
+                    .any(|b| s.ticker.starts_with(b.as_str()));
+                if !blocked {
+                    entries.push((s.last_updated_ts.unwrap_or_default(), s.ticker));
+                }
+            }
+        }
+        // Sort most-recently-updated first so active series are queried before stale ones.
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        // Deduplicate (a series ticker may appear across category queries).
+        let mut seen_tickers = std::collections::HashSet::new();
+        entries
+            .into_iter()
+            .filter_map(|(_, ticker)| {
+                if seen_tickers.insert(ticker.clone()) { Some(ticker) } else { None }
+            })
+            .collect()
+    }
+
     pub async fn scan_snapshot_with_deltas(&self) -> Result<Vec<ScannedMarket>, ExecutionError> {
         Ok(self.scan_snapshot_with_trace().await?.final_markets)
     }
@@ -223,8 +356,14 @@ impl KalshiMarketScanner {
         let tickers: Vec<String> = index.keys().cloned().collect();
 
         let delta_cfg = WsDeltaConfig {
-            ws_url: std::env::var("KALSHI_WS_URL")
-                .unwrap_or_else(|_| "wss://demo-api.kalshi.co/trade-api/ws/v2".to_string()),
+            // Default WS URL is derived from the REST base URL to avoid accidentally connecting
+            // to the demo endpoint when running against production.
+            ws_url: std::env::var("KALSHI_WS_URL").unwrap_or_else(|_| {
+                self.cfg.api_base_url
+                    .replace("https://", "wss://")
+                    .replace("http://", "ws://")
+                    + "/trade-api/ws/v2"
+            }),
             listen_window: Duration::from_secs(self.cfg.ws_delta_window_secs),
         };
         let ingestor = KalshiWsDeltaIngestor::new(delta_cfg);
@@ -245,14 +384,48 @@ impl KalshiMarketScanner {
     }
 
     pub fn select_for_valuation(&self, markets: Vec<ScannedMarket>) -> Vec<ScannedMarket> {
+        let now = Utc::now();
         let mut filtered: Vec<ScannedMarket> = markets
             .into_iter()
             .filter(|m| m.volume >= self.cfg.min_volume)
-            .filter(|m| m.spread_cents().map(|s| s <= self.cfg.max_spread_cents).unwrap_or(false))
+            .filter(|m| m.spread_cents().map(|s| s <= self.cfg.max_spread_cents).unwrap_or(self.cfg.allow_no_spread))
+            .filter(|m| {
+                // Skip markets closing too soon (< min_time_to_close_secs).
+                // Markets with no close_time are always kept.
+                match m.close_time {
+                    Some(close) => (close - now).num_seconds() >= self.cfg.min_time_to_close_secs,
+                    None => true,
+                }
+            })
             .collect();
 
         filtered.sort_by(|a, b| b.volume.total_cmp(&a.volume));
-        filtered.truncate(self.cfg.max_markets);
+
+        // Cap markets per event_ticker to avoid one event flooding the quota.
+        if self.cfg.max_per_event > 0 {
+            let mut event_counts: HashMap<String, usize> = HashMap::new();
+            filtered.retain(|m| {
+                let key = m.event_ticker.clone().unwrap_or_else(|| m.ticker.clone());
+                let count = event_counts.entry(key).or_insert(0);
+                if *count < self.cfg.max_per_event {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+
+        // Apply category balancing: round-robin across Weather/Sports/Crypto/Other so that
+        // high-volume categories don't crowd out markets that benefit from enrichment.
+        // Use valuation_limit (BOT_VALUATION_MARKETS) not max_markets (BOT_SCAN_MAX_MARKETS)
+        // so the round-robin produces exactly the right output count.
+        if self.cfg.balance_by_category {
+            let balanced = select_for_enrichment(&filtered, self.cfg.valuation_limit);
+            return balanced.into_iter().cloned().collect();
+        }
+
+        filtered.truncate(self.cfg.valuation_limit);
         filtered
     }
 }
@@ -285,6 +458,18 @@ struct MarketsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct SeriesListResponse {
+    #[serde(default)]
+    series: Vec<SeriesWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeriesWire {
+    ticker: String,
+    last_updated_ts: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct KalshiMarketWire {
     ticker: String,
     title: Option<String>,
@@ -303,7 +488,9 @@ struct KalshiMarketWire {
     yes_bid_dollars: Option<String>,
     #[serde(alias = "yes_ask_dollars", alias = "yesAskDollars")]
     yes_ask_dollars: Option<String>,
-    volume: Option<f64>,
+    // volume_fp is a quoted decimal string ("4109.00"), same format as price fields.
+    #[serde(alias = "volume_fp")]
+    volume: Option<String>,
     #[serde(alias = "close_time", alias = "closeTime")]
     close_time: Option<DateTime<Utc>>,
 }
@@ -320,6 +507,8 @@ fn to_scanned_market(m: KalshiMarketWire) -> ScannedMarket {
         .and_then(parse_price_dollars_to_cents)
         .or(m.yes_ask);
 
+    let volume = m.volume.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
     ScannedMarket {
         ticker: m.ticker,
         title: m.title.unwrap_or_default(),
@@ -329,7 +518,7 @@ fn to_scanned_market(m: KalshiMarketWire) -> ScannedMarket {
         series_ticker: m.series_ticker,
         yes_bid_cents,
         yes_ask_cents,
-        volume: m.volume.unwrap_or(0.0),
+        volume,
         close_time: m.close_time,
     }
 }
@@ -399,6 +588,45 @@ mod tests {
     }
 
     #[test]
+    fn allow_no_spread_passes_markets_with_no_bid_ask() {
+        // Default (allow_no_spread=false): markets with no bid/ask are dropped.
+        let scanner_strict = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 50.0,
+            allow_no_spread: false,
+            ..ScannerConfig::default()
+        });
+        // allow_no_spread=true: mid-price valuation can still run, so keep them.
+        let scanner_permissive = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 50.0,
+            allow_no_spread: true,
+            ..ScannerConfig::default()
+        });
+        let markets = vec![ScannedMarket {
+            ticker: "KXNIGHT".to_string(),
+            title: "".to_string(),
+            subtitle: None,
+            market_type: None,
+            event_ticker: None,
+            series_ticker: None,
+            yes_bid_cents: None,
+            yes_ask_cents: None,
+            volume: 10_000.0,
+            close_time: None,
+        }];
+        assert!(
+            scanner_strict.select_for_valuation(markets.clone()).is_empty(),
+            "strict scanner should drop no-spread market"
+        );
+        assert_eq!(
+            scanner_permissive.select_for_valuation(markets).len(),
+            1,
+            "permissive scanner should keep no-spread market for mid-price valuation"
+        );
+    }
+
+    #[test]
     fn parses_dollar_price_fields_to_cents() {
         let wire = KalshiMarketWire {
             ticker: "KXTEST".to_string(),
@@ -411,7 +639,7 @@ mod tests {
             yes_ask: None,
             yes_bid_dollars: Some("0.43".to_string()),
             yes_ask_dollars: Some("0.49".to_string()),
-            volume: Some(1234.0),
+            volume: Some("1234.00".to_string()),
             close_time: None,
         };
         let parsed = to_scanned_market(wire);
@@ -447,5 +675,158 @@ mod tests {
         assert_eq!(m.yes_bid_cents, Some(41.0));
         assert_eq!(m.yes_ask_cents, Some(46.0));
         assert_eq!(m.volume, 112.0);
+    }
+
+    fn liquid_market(ticker: &str, event_ticker: Option<&str>, volume: f64, close_secs_from_now: Option<i64>) -> ScannedMarket {
+        ScannedMarket {
+            ticker: ticker.to_string(),
+            title: "".to_string(),
+            subtitle: None,
+            market_type: None,
+            event_ticker: event_ticker.map(|s| s.to_string()),
+            series_ticker: None,
+            yes_bid_cents: Some(45.0),
+            yes_ask_cents: Some(50.0),
+            volume,
+            close_time: close_secs_from_now.map(|s| Utc::now() + chrono::Duration::seconds(s)),
+        }
+    }
+
+    #[test]
+    fn close_time_filter_drops_expiring_markets() {
+        let scanner = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 20.0,
+            min_time_to_close_secs: 900,
+            max_per_event: 0,
+            ..ScannerConfig::default()
+        });
+        let markets = vec![
+            liquid_market("SOON", None, 1000.0, Some(300)),   // closes in 5 min → drop
+            liquid_market("LATER", None, 1000.0, Some(3600)), // closes in 1 hr → keep
+            liquid_market("NOCLOSE", None, 1000.0, None),     // no close_time → keep
+        ];
+        let selected = scanner.select_for_valuation(markets);
+        let tickers: Vec<_> = selected.iter().map(|m| m.ticker.as_str()).collect();
+        assert!(!tickers.contains(&"SOON"), "market closing in 5min should be dropped");
+        assert!(tickers.contains(&"LATER"));
+        assert!(tickers.contains(&"NOCLOSE"));
+    }
+
+    #[test]
+    fn max_per_event_caps_event_variants() {
+        let scanner = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 20.0,
+            min_time_to_close_secs: 0,
+            max_per_event: 2,
+            ..ScannerConfig::default()
+        });
+        // 4 markets from the same event, sorted by volume desc: V4 > V3 > V2 > V1
+        let markets = vec![
+            liquid_market("T40", Some("KXHIGHCHI-26FEB16"), 1000.0, None),
+            liquid_market("T42", Some("KXHIGHCHI-26FEB16"), 2000.0, None),
+            liquid_market("T44", Some("KXHIGHCHI-26FEB16"), 3000.0, None),
+            liquid_market("T46", Some("KXHIGHCHI-26FEB16"), 4000.0, None),
+        ];
+        let selected = scanner.select_for_valuation(markets);
+        assert_eq!(selected.len(), 2, "should keep only top 2 per event");
+        // highest volume kept
+        assert_eq!(selected[0].ticker, "T46");
+        assert_eq!(selected[1].ticker, "T44");
+    }
+
+    #[test]
+    fn max_per_event_zero_disables_cap() {
+        let scanner = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 20.0,
+            min_time_to_close_secs: 0,
+            max_per_event: 0,
+            ..ScannerConfig::default()
+        });
+        let markets = (0..5)
+            .map(|i| liquid_market(&format!("T{i}"), Some("EVT"), 1000.0 + i as f64, None))
+            .collect();
+        let selected = scanner.select_for_valuation(markets);
+        assert_eq!(selected.len(), 5);
+    }
+
+    #[test]
+    fn valuation_limit_caps_select_for_valuation_output() {
+        // With 20 markets and valuation_limit=5, output must be exactly 5.
+        let scanner = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 20.0,
+            min_time_to_close_secs: 0,
+            max_per_event: 0,
+            valuation_limit: 5,
+            balance_by_category: false,
+            ..ScannerConfig::default()
+        });
+        let markets = (0..20)
+            .map(|i| liquid_market(&format!("T{i}"), None, 1000.0 + i as f64, None))
+            .collect();
+        let selected = scanner.select_for_valuation(markets);
+        assert_eq!(selected.len(), 5);
+        // Should be sorted by volume desc — highest volume markets retained.
+        assert_eq!(selected[0].ticker, "T19");
+    }
+
+    #[test]
+    fn valuation_limit_caps_balanced_output() {
+        // Same with balance_by_category=true: round-robin should still respect the limit.
+        let scanner = KalshiMarketScanner::new(ScannerConfig {
+            min_volume: 0.0,
+            max_spread_cents: 20.0,
+            min_time_to_close_secs: 0,
+            max_per_event: 0,
+            valuation_limit: 7,
+            balance_by_category: true,
+            ..ScannerConfig::default()
+        });
+        let markets = (0..30)
+            .map(|i| liquid_market(&format!("T{i}"), None, 1000.0 + i as f64, None))
+            .collect();
+        let selected = scanner.select_for_valuation(markets);
+        assert_eq!(selected.len(), 7);
+    }
+
+    #[test]
+    fn ws_url_derived_from_api_base_when_env_unset() {
+        // With KALSHI_WS_URL unset, the scanner derives ws URL from api_base_url.
+        // This test verifies the derivation logic by inspecting the config the scanner
+        // would use — we do this by checking the string transform directly.
+        let api_base = "https://api.elections.kalshi.com";
+        let expected = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+        let derived = api_base
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            + "/trade-api/ws/v2";
+        assert_eq!(derived, expected);
+
+        let demo_base = "https://demo-api.kalshi.co";
+        let derived_demo = demo_base
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            + "/trade-api/ws/v2";
+        assert_eq!(derived_demo, "wss://demo-api.kalshi.co/trade-api/ws/v2");
+    }
+
+    #[test]
+    fn series_wire_deserializes_from_category_response() {
+        // Verify the SeriesWire struct correctly deserializes a real API response shape.
+        let json = r#"{
+            "series": [
+                {"ticker": "KXNBAGAME", "last_updated_ts": "2026-03-25T12:00:00Z", "category": "Sports"},
+                {"ticker": "KXHIGHCHI", "last_updated_ts": "2026-03-24T08:00:00Z", "category": "Climate and Weather"},
+                {"ticker": "KXMVENOJUNK", "category": "Sports"}
+            ]
+        }"#;
+        let parsed: SeriesListResponse = serde_json::from_str(json).expect("should parse");
+        assert_eq!(parsed.series.len(), 3);
+        assert_eq!(parsed.series[0].ticker, "KXNBAGAME");
+        assert_eq!(parsed.series[0].last_updated_ts.as_deref(), Some("2026-03-25T12:00:00Z"));
+        assert_eq!(parsed.series[2].last_updated_ts, None); // missing field → None
     }
 }

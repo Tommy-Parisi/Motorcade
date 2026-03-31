@@ -179,7 +179,10 @@ fn parse_aliases(raw: &str) -> HashMap<String, String> {
 }
 
 fn looks_like_ticker(input: &str) -> bool {
-    input.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && input.len() >= 6
+    input
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && input.len() >= 6
 }
 
 fn normalize(s: &str) -> String {
@@ -222,6 +225,22 @@ mod tests {
         }];
         let resolved = choose_market_ticker("KXBTC-26DEC31-B120000", &markets).expect("should resolve");
         assert_eq!(resolved, "KXBTC-26DEC31-B120000");
+    }
+
+    #[test]
+    fn decimal_strike_tickers_look_like_tickers() {
+        // Kalshi tickers with decimal strikes must not fall through to API search
+        assert!(looks_like_ticker("KXSILVERD-26MAR3017-T71.25"));
+        assert!(looks_like_ticker("KXGOLDMON-26MAR3117-B4400.00"));
+        assert!(looks_like_ticker("KXBTCD-26MAR2217-T70849.99"));
+        assert!(looks_like_ticker("KXHIGHHOU-26FEB16-B74.5"));
+        assert!(looks_like_ticker("KXETHD-26MAR2217-T2469.99"));
+        // Plain tickers still work
+        assert!(looks_like_ticker("KXSILVERD-26MAR3017-T70"));
+        assert!(looks_like_ticker("KXNBAGAME-26MAR27HOUMEM-HOU"));
+        // Short or empty should not match
+        assert!(!looks_like_ticker("ABC"));
+        assert!(!looks_like_ticker(""));
     }
 
     #[test]

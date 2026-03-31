@@ -150,6 +150,8 @@ pub struct ExecutionModelArtifact {
     pub organic_paper_rows: usize,
     #[serde(default)]
     pub live_real_rows: usize,
+    #[serde(default)]
+    pub retroactive_synthetic_rows: usize,
     pub feature_schema_version: String,
     pub metrics: ExecutionModelMetrics,
     pub global: ExecutionBucket,
@@ -581,6 +583,10 @@ fn train_artifact(
         live_real_rows: all_rows
             .iter()
             .filter(|row| row.execution_source_class == "live_real")
+            .count(),
+        retroactive_synthetic_rows: all_rows
+            .iter()
+            .filter(|row| row.execution_source_class == "retroactive_synthetic")
             .count(),
         feature_schema_version: train_rows
             .first()

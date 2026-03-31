@@ -10,6 +10,7 @@ use crate::execution::types::{ExecutionError, TimeInForce};
 pub struct PolicyReportConfig {
     pub enabled: bool,
     pub cycle_dir: PathBuf,
+    pub day_filter: Option<String>,
 }
 
 impl PolicyReportConfig {
@@ -26,6 +27,10 @@ impl PolicyReportConfig {
                 std::env::var("BOT_POLICY_REPORT_CYCLE_DIR")
                     .unwrap_or_else(|_| default_cycle_dir.to_string()),
             ),
+            day_filter: std::env::var("BOT_POLICY_REPORT_DAY")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         }
     }
 }
@@ -33,6 +38,7 @@ impl PolicyReportConfig {
 #[derive(Debug, Serialize)]
 pub struct PolicyReportSummary {
     pub cycle_dir: String,
+    pub day_filter: Option<String>,
     pub cycle_files_seen: usize,
     pub completed_cycles: usize,
     pub cycles_with_policy: usize,
@@ -135,6 +141,11 @@ pub fn run_policy_report(cfg: &PolicyReportConfig) -> Result<PolicyReportSummary
             Ok(v) => v,
             Err(_) => continue,
         };
+        if let Some(day_filter) = cfg.day_filter.as_deref() {
+            if artifact.started_at.format("%Y-%m-%d").to_string() != day_filter {
+                continue;
+            }
+        }
         *policy_modes.entry(artifact.policy_mode.clone()).or_insert(0) += 1;
         if artifact.status == "completed" {
             completed_cycles += 1;
@@ -215,6 +226,7 @@ pub fn run_policy_report(cfg: &PolicyReportConfig) -> Result<PolicyReportSummary
 
     Ok(PolicyReportSummary {
         cycle_dir: cfg.cycle_dir.display().to_string(),
+        day_filter: cfg.day_filter.clone(),
         cycle_files_seen: cycle_files.len(),
         completed_cycles,
         cycles_with_policy,

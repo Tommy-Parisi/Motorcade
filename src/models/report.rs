@@ -13,6 +13,7 @@ pub struct ModelReportConfig {
     pub enabled: bool,
     pub forecast_dataset_path: PathBuf,
     pub execution_dataset_path: PathBuf,
+    pub execution_supplemental_paths: Vec<PathBuf>,
     pub forecast_model_path: PathBuf,
     pub execution_model_path: PathBuf,
     pub forecast_min_bucket_samples: usize,
@@ -38,6 +39,13 @@ impl ModelReportConfig {
                 std::env::var("BOT_EXECUTION_DATASET_PATH")
                     .unwrap_or_else(|_| "var/features/execution/execution_training.jsonl".to_string()),
             ),
+            execution_supplemental_paths: std::env::var("BOT_EXECUTION_SUPPLEMENTAL_PATHS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect(),
             forecast_model_path: PathBuf::from(
                 std::env::var("BOT_MODEL_FORECAST_REPORT_PATH")
                     .or_else(|_| std::env::var("BOT_MODEL_FORECAST_PATH"))
@@ -103,6 +111,7 @@ pub struct ForecastReportSummary {
 pub struct ExecutionReportSummary {
     pub model_path: String,
     pub dataset_path: String,
+    pub supplemental_dataset_paths: Vec<String>,
     pub model_version: String,
     pub trained_at: String,
     pub included_source_classes: Vec<String>,
@@ -114,6 +123,7 @@ pub struct ExecutionReportSummary {
     pub bootstrap_rows: usize,
     pub organic_paper_rows: usize,
     pub live_real_rows: usize,
+    pub retroactive_synthetic_rows: usize,
     pub warning_messages: Vec<String>,
     pub validation_brier_fill_30s: Option<f64>,
     pub validation_brier_fill_5m: Option<f64>,
@@ -131,7 +141,10 @@ pub fn run_model_report(cfg: &ModelReportConfig) -> Result<ModelReportSummary, E
     let execution_model =
         ExecutionModel::load_from_path(&cfg.execution_model_path, cfg.execution_min_bucket_samples)?;
     let forecast_rows = load_jsonl::<ForecastTrainingRow>(&cfg.forecast_dataset_path)?;
-    let execution_rows_raw = load_jsonl::<ExecutionTrainingRow>(&cfg.execution_dataset_path)?;
+    let mut execution_rows_raw = load_jsonl::<ExecutionTrainingRow>(&cfg.execution_dataset_path)?;
+    for path in &cfg.execution_supplemental_paths {
+        execution_rows_raw.extend(load_jsonl::<ExecutionTrainingRow>(path)?);
+    }
     let execution_rows: Vec<_> = execution_rows_raw
         .iter()
         .filter(|row| {
@@ -195,6 +208,11 @@ pub fn run_model_report(cfg: &ModelReportConfig) -> Result<ModelReportSummary, E
     let execution = ExecutionReportSummary {
         model_path: cfg.execution_model_path.display().to_string(),
         dataset_path: cfg.execution_dataset_path.display().to_string(),
+        supplemental_dataset_paths: cfg
+            .execution_supplemental_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
         model_version: execution_model.artifact().model_version.clone(),
         trained_at: execution_model.artifact().trained_at.to_rfc3339(),
         included_source_classes: cfg.execution_include_source_classes.clone(),
@@ -214,6 +232,10 @@ pub fn run_model_report(cfg: &ModelReportConfig) -> Result<ModelReportSummary, E
         live_real_rows: execution_rows
             .iter()
             .filter(|row| row.execution_source_class == "live_real")
+            .count(),
+        retroactive_synthetic_rows: execution_rows
+            .iter()
+            .filter(|row| row.execution_source_class == "retroactive_synthetic")
             .count(),
         warning_messages: execution_warning_messages(
             execution_model.artifact().train_rows,
@@ -274,6 +296,12 @@ fn execution_warning_messages(
     if included_source_classes.iter().any(|s| s == "bootstrap_synthetic") {
         warnings.push(
             "execution report includes bootstrap_synthetic rows; do not use this configuration for active-mode trust decisions"
+                .to_string(),
+        );
+    }
+    if included_source_classes.iter().any(|s| s == "retroactive_synthetic") {
+        warnings.push(
+            "execution report includes retroactive_synthetic rows; compare conclusions against organic_paper/live_real slices before trusting policy quality"
                 .to_string(),
         );
     }

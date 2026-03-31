@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::types::ExecutionError;
-use crate::research::events::MarketStateEvent;
+use crate::research::events::{MarketStateEvent, OrderLifecycleEvent};
 
 pub const OUTCOME_SCHEMA_VERSION: &str = "v1";
 
@@ -144,6 +144,45 @@ fn collect_candidate_tickers(
             }
         }
     }
+    // No date cutoff for order_lifecycle: we want to backfill outcomes for all tickers
+    // we ever placed orders on, including sports markets from before the market_state
+    // lookback window. Already-resolved tickers are deduped by load_existing_outcomes().
+    let order_lifecycle_root = cfg.research_dir.join("order_lifecycle");
+    if order_lifecycle_root.exists() {
+        for entry in
+            fs::read_dir(&order_lifecycle_root).map_err(|e| ExecutionError::Exchange(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for file in
+                fs::read_dir(path).map_err(|e| ExecutionError::Exchange(e.to_string()))?
+            {
+                let file = file.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+                let file_path = file.path();
+                if file_path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let text = fs::read_to_string(&file_path)
+                    .map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: OrderLifecycleEvent = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if event.filled_qty > 0.0 {
+                        out.entry(event.ticker).or_insert(None);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -341,5 +380,83 @@ mod tests {
         });
         assert_eq!(parse_resolution_status(&v), "canceled");
         assert_eq!(parse_outcome_yes(&v), None);
+    }
+
+    #[test]
+    fn parses_all_resolved_status_variants() {
+        for status in &["settled", "resolved", "finalized", "closed", "expired"] {
+            let v: Value = serde_json::json!({ "status": status });
+            assert_eq!(
+                parse_resolution_status(&v),
+                "resolved",
+                "expected 'resolved' for status='{}'",
+                status
+            );
+        }
+        for status in &["canceled", "void"] {
+            let v: Value = serde_json::json!({ "status": status });
+            assert_eq!(
+                parse_resolution_status(&v),
+                "canceled",
+                "expected 'canceled' for status='{}'",
+                status
+            );
+        }
+        // Active market returns unresolved
+        let v: Value = serde_json::json!({ "status": "active" });
+        assert_eq!(parse_resolution_status(&v), "unresolved");
+    }
+
+    #[test]
+    fn order_lifecycle_tickers_collected_regardless_of_age() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let research_dir = tmp.path().to_path_buf();
+
+        let old_day = (Utc::now() - Duration::days(30))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let ol_dir = research_dir.join("order_lifecycle").join(&old_day);
+        fs::create_dir_all(&ol_dir).unwrap();
+        let ol_file = ol_dir.join("order_lifecycle.jsonl");
+        let event = serde_json::json!({
+            "schema_version": "v1",
+            "ts": "2026-01-01T00:00:00Z",
+            "client_order_id": "test-123",
+            "order_id": null,
+            "ticker": "SPORTS-OLD-TICKER",
+            "outcome_id": "yes",
+            "side": "Buy",
+            "tif": "Ioc",
+            "limit_price": 0.5,
+            "requested_qty": 10.0,
+            "filled_qty": 10.0,
+            "avg_fill_price": 0.5,
+            "fee_paid": null,
+            "signal_fair_price": null,
+            "signal_observed_price": null,
+            "signal_edge_pct": null,
+            "signal_confidence": null,
+            "status": null,
+            "event_type": "filled",
+            "error": null
+        });
+        fs::write(&ol_file, format!("{}\n", event)).unwrap();
+
+        let cfg = OutcomeResolverConfig {
+            enabled: true,
+            api_base_url: "http://localhost".to_string(),
+            research_dir,
+            lookback_days: 14,
+        };
+
+        let candidates = collect_candidate_tickers(&cfg).unwrap();
+        assert!(
+            candidates.contains_key("SPORTS-OLD-TICKER"),
+            "old sports ticker should be collected with no date cutoff; got: {:?}",
+            candidates.keys().collect::<Vec<_>>()
+        );
     }
 }

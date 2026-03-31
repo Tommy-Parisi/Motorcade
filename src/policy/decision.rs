@@ -19,6 +19,7 @@ pub struct PolicyConfig {
     pub shadow_enabled: bool,
     pub shadow_root: PathBuf,
     pub min_expected_realized_pnl: f64,
+    pub markout_veto_threshold_bps: f64,
     pub max_actions_per_candidate: usize,
     pub default_legacy_fallback: bool,
     pub active_max_model_age_hours: i64,
@@ -26,6 +27,9 @@ pub struct PolicyConfig {
     pub active_min_execution_train_rows: usize,
     pub active_min_execution_live_real_rows: usize,
     pub active_require_live_real: bool,
+    pub active_min_shadow_decisions: usize,
+    pub active_shadow_lookback_days: i64,
+    pub active_min_shadow_mean_erpnl: f64,
 }
 
 impl PolicyConfig {
@@ -46,6 +50,10 @@ impl PolicyConfig {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0),
+            markout_veto_threshold_bps: std::env::var("BOT_POLICY_MARKOUT_VETO_THRESHOLD_BPS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(-300.0),
             max_actions_per_candidate: std::env::var("BOT_POLICY_MAX_ACTIONS_PER_CANDIDATE")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -82,6 +90,19 @@ impl PolicyConfig {
                     .as_str(),
                 "1" | "true" | "yes"
             ),
+            active_min_shadow_decisions: std::env::var("BOT_POLICY_ACTIVE_MIN_SHADOW_DECISIONS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50),
+            active_shadow_lookback_days: std::env::var("BOT_POLICY_ACTIVE_SHADOW_LOOKBACK_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(7)
+                .max(1),
+            active_min_shadow_mean_erpnl: std::env::var("BOT_POLICY_ACTIVE_MIN_SHADOW_MEAN_ERPNL")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(-200.0),
         }
     }
 }
@@ -119,6 +140,7 @@ pub struct PolicyDecision {
     pub expected_gross_edge: f64,
     pub expected_realized_pnl: f64,
     pub expected_fill_prob: f64,
+    pub chosen_fair_price: f64,
     pub rejection_reason: Option<String>,
     pub rationale: String,
 }
@@ -193,6 +215,7 @@ pub fn decide_shadow_policy(
         expected_gross_edge: candidate.fair_price - candidate.observed_price,
         expected_realized_pnl: if cfg.default_legacy_fallback { candidate.edge_pct * 100.0 } else { 0.0 },
         expected_fill_prob: if cfg.default_legacy_fallback { 1.0 } else { 0.0 },
+        chosen_fair_price: candidate.fair_price,
         rejection_reason: (!cfg.default_legacy_fallback).then_some("no_action_candidates".to_string()),
         rationale: if cfg.default_legacy_fallback {
             "policy fallback to legacy candidate".to_string()
@@ -296,6 +319,37 @@ fn score_action(
     let expected_realized_pnl = execution.fill_prob_5m
         * ((expected_gross_edge + markout_value) / execution.expected_fill_price.max(0.01))
         * 100.0;
+
+    // Hard veto: reject before PnL gate if execution model predicts severe adverse selection.
+    // This prevents candidates with large signal edge but persistently negative markout
+    // (e.g. ETH intraday markets) from passing through to should_trade=true.
+    if execution.expected_markout_bps_5m < cfg.markout_veto_threshold_bps {
+        return PolicyDecision {
+            ticker: candidate.ticker.clone(),
+            outcome_id: candidate.outcome_id.clone(),
+            side: candidate.side,
+            should_trade: false,
+            limit_price: execution.candidate_limit_price,
+            time_in_force: execution.tif,
+            size_multiplier: 0.0,
+            expected_gross_edge,
+            expected_realized_pnl,
+            expected_fill_prob: execution.fill_prob_5m,
+            chosen_fair_price,
+            rejection_reason: Some(format!(
+                "markout_veto(expected_markout_bps_5m={:.1} < threshold={:.1})",
+                execution.expected_markout_bps_5m, cfg.markout_veto_threshold_bps
+            )),
+            rationale: format!(
+                "policy shadow: fair={:.4} fill5m={:.4} fill_price={:.4} markout5m_bps={:.2}",
+                chosen_fair_price,
+                execution.fill_prob_5m,
+                execution.expected_fill_price,
+                execution.expected_markout_bps_5m
+            ),
+        };
+    }
+
     let should_trade = expected_realized_pnl >= cfg.min_expected_realized_pnl;
     let size_multiplier = if should_trade {
         (execution.fill_prob_5m * forecast_output.confidence).clamp(0.10, 1.0)
@@ -317,6 +371,7 @@ fn score_action(
         expected_gross_edge,
         expected_realized_pnl,
         expected_fill_prob: execution.fill_prob_5m,
+        chosen_fair_price,
         rejection_reason,
         rationale: format!(
             "policy shadow: fair={:.4} fill5m={:.4} fill_price={:.4} markout5m_bps={:.2}",
@@ -340,6 +395,7 @@ mod tests {
             shadow_enabled: true,
             shadow_root: PathBuf::from("var/shadow"),
             min_expected_realized_pnl: 0.0,
+            markout_veto_threshold_bps: -300.0,
             max_actions_per_candidate: 4,
             default_legacy_fallback: true,
             active_max_model_age_hours: 24 * 14,
@@ -347,6 +403,9 @@ mod tests {
             active_min_execution_train_rows: 100,
             active_min_execution_live_real_rows: 25,
             active_require_live_real: true,
+            active_min_shadow_decisions: 50,
+            active_shadow_lookback_days: 7,
+            active_min_shadow_mean_erpnl: -200.0,
         };
         let candidate = CandidateTrade {
             ticker: "KXTEST".to_string(),
@@ -393,6 +452,7 @@ mod tests {
             shadow_enabled: false,
             shadow_root: PathBuf::from("/tmp"),
             min_expected_realized_pnl: min_pnl,
+            markout_veto_threshold_bps: -300.0,
             max_actions_per_candidate: 4,
             default_legacy_fallback: true,
             active_max_model_age_hours: 24 * 14,
@@ -400,6 +460,9 @@ mod tests {
             active_min_execution_train_rows: 100,
             active_min_execution_live_real_rows: 25,
             active_require_live_real: true,
+            active_min_shadow_decisions: 50,
+            active_shadow_lookback_days: 7,
+            active_min_shadow_mean_erpnl: -200.0,
         }
     }
 
@@ -489,5 +552,71 @@ mod tests {
         let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), good_execution());
         assert!(!decision.should_trade);
         assert_eq!(decision.size_multiplier, 0.0);
+    }
+
+    #[test]
+    fn markout_veto_rejects_severe_adverse_selection() {
+        let cfg = make_cfg(0.0);
+        let execution = ExecutionEstimate {
+            expected_markout_bps_5m: -400.0,
+            ..good_execution()
+        };
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), execution);
+        assert!(!decision.should_trade);
+        assert_eq!(decision.size_multiplier, 0.0);
+        assert!(
+            decision.rejection_reason.as_deref().unwrap_or("").starts_with("markout_veto"),
+            "expected markout_veto rejection, got: {:?}",
+            decision.rejection_reason
+        );
+    }
+
+    #[test]
+    fn markout_veto_does_not_fire_above_threshold() {
+        let cfg = make_cfg(0.0);
+        let execution = ExecutionEstimate {
+            expected_markout_bps_5m: -299.0,
+            ..good_execution()
+        };
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.65), execution);
+        if let Some(reason) = &decision.rejection_reason {
+            assert!(!reason.starts_with("markout_veto"), "unexpected veto at -299 bps: {reason}");
+        }
+    }
+
+    #[test]
+    fn chosen_fair_price_set_for_yes_outcome() {
+        let cfg = make_cfg(0.0);
+        let decision = score_action(&cfg, &make_candidate(), &make_forecast(0.72), good_execution());
+        assert!((decision.chosen_fair_price - 0.72).abs() < 1e-9);
+    }
+
+    #[test]
+    fn chosen_fair_price_set_for_no_outcome() {
+        let cfg = make_cfg(0.0);
+        let mut candidate = make_candidate();
+        candidate.outcome_id = "no".to_string();
+        let decision = score_action(&cfg, &candidate, &make_forecast(0.30), good_execution());
+        assert!((decision.chosen_fair_price - 0.70).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_decision_chosen_fair_price_field() {
+        let d = PolicyDecision {
+            ticker: "T".to_string(),
+            outcome_id: "yes".to_string(),
+            side: Side::Buy,
+            should_trade: true,
+            limit_price: 0.45,
+            time_in_force: TimeInForce::Gtc,
+            size_multiplier: 0.5,
+            expected_gross_edge: 0.10,
+            expected_realized_pnl: 5.0,
+            expected_fill_prob: 0.8,
+            chosen_fair_price: 0.55,
+            rejection_reason: None,
+            rationale: "test".to_string(),
+        };
+        assert_eq!(d.chosen_fair_price, 0.55);
     }
 }

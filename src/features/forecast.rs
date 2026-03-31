@@ -38,6 +38,7 @@ pub struct ForecastFeatureRow {
     pub weather_signal: Option<f64>,
     pub sports_injury_signal: Option<f64>,
     pub crypto_sentiment_signal: Option<f64>,
+    pub finance_price_signal: Option<f64>,
     pub entity_primary: Option<String>,
     pub entity_secondary: Option<String>,
     pub threshold_value: Option<f64>,
@@ -79,6 +80,7 @@ pub fn build_forecast_feature_row(
         weather_signal: enrichment.and_then(|e| e.weather_signal),
         sports_injury_signal: enrichment.and_then(|e| e.sports_injury_signal),
         crypto_sentiment_signal: enrichment.and_then(|e| e.crypto_sentiment_signal),
+        finance_price_signal: enrichment.and_then(|e| e.finance_price_signal),
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,
@@ -117,6 +119,7 @@ pub fn build_forecast_feature_row_from_event(event: &MarketStateEvent) -> Foreca
         weather_signal: None,
         sports_injury_signal: None,
         crypto_sentiment_signal: None,
+        finance_price_signal: event.finance_price_signal,
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,
@@ -175,7 +178,7 @@ pub fn parse_market_metadata(
         None
     };
 
-    let threshold_value = extract_threshold_value(&normalized).or_else(|| extract_threshold_value(ticker));
+    let threshold_value = extract_threshold_value(&normalized).or_else(|| extract_threshold_from_ticker(ticker));
     let event_date_hint = extract_date_hint(ticker).or_else(|| extract_date_hint(&normalized));
     let (entity_primary, entity_secondary) = extract_entities(&normalized);
 
@@ -191,33 +194,34 @@ pub fn parse_market_metadata(
 
 fn vertical_name(vertical: MarketVertical) -> String {
     match vertical {
-        MarketVertical::Weather => "weather",
-        MarketVertical::Sports => "sports",
-        MarketVertical::Crypto => "crypto",
-        MarketVertical::Other => "other",
+        MarketVertical::Weather  => "weather",
+        MarketVertical::Sports   => "sports",
+        MarketVertical::Esports  => "esports",
+        MarketVertical::Finance  => "finance",
+        MarketVertical::Politics => "politics",
+        MarketVertical::Crypto   => "crypto",
+        MarketVertical::Other    => "other",
     }
     .to_string()
 }
 
 fn infer_vertical_from_title_or_ticker(ticker: &str, title: &str) -> MarketVertical {
-    let ticker = ticker.to_ascii_uppercase();
-    let title = title.to_ascii_uppercase();
-    if ticker.contains("HIGH") || title.contains("TEMP") || title.contains("WEATHER") {
-        MarketVertical::Weather
-    } else if ticker.contains("NBA")
-        || ticker.contains("NFL")
-        || ticker.contains("MLB")
-        || ticker.contains("NHL")
-        || ticker.contains("TENNIS")
-        || title.contains("VS ")
-        || title.contains("WINNER")
-    {
-        MarketVertical::Sports
-    } else if ticker.contains("BTC") || ticker.contains("ETH") || title.contains("BITCOIN") {
-        MarketVertical::Crypto
-    } else {
-        MarketVertical::Other
-    }
+    // Delegate to detect_vertical via a lightweight ScannedMarket proxy.
+    // This avoids duplicating the classification logic.
+    use crate::data::market_scanner::ScannedMarket;
+    let proxy = ScannedMarket {
+        ticker: ticker.to_string(),
+        title: title.to_string(),
+        subtitle: None,
+        market_type: None,
+        event_ticker: None,
+        series_ticker: None,
+        yes_bid_cents: None,
+        yes_ask_cents: None,
+        volume: 0.0,
+        close_time: None,
+    };
+    crate::data::market_enrichment::detect_vertical(&proxy)
 }
 
 fn extract_threshold_value(raw: &str) -> Option<f64> {
@@ -236,6 +240,31 @@ fn extract_threshold_value(raw: &str) -> Option<f64> {
     } else {
         buf.parse::<f64>().ok()
     }
+}
+
+/// Extract a threshold value specifically from a Kalshi ticker segment.
+/// Looks for `-T{number}` or `-B{number}` patterns (e.g. `KXHIGHINFLATION-26DEC-T3.8` → 3.8,
+/// `KXBNB-26MAR2417-B537` → 537). This avoids the title-based extractor grabbing date digits
+/// from the ticker (e.g. `26` from `26DEC`).
+/// Extract a threshold value specifically from a Kalshi ticker segment.
+/// Looks for `-T{number}` or `-B{number}` patterns (e.g. `KXHIGHINFLATION-26DEC-T3.8` → 3.8,
+/// `KXBNB-26MAR2417-B537` → 537). This avoids the title-based extractor grabbing date digits
+/// from the ticker (e.g. `26` from `26DEC`).
+pub fn extract_threshold_from_ticker(ticker: &str) -> Option<f64> {
+    let upper = ticker.to_ascii_uppercase();
+    for segment in upper.split('-') {
+        // Segment must start with T or B followed immediately by a digit
+        let rest = match segment.strip_prefix('T').or_else(|| segment.strip_prefix('B')) {
+            Some(r) if r.starts_with(|c: char| c.is_ascii_digit()) => r,
+            _ => continue,
+        };
+        // Take the longest leading numeric prefix (handles "305.0" and "537")
+        let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
+        if let Ok(v) = rest[..end].parse::<f64>() {
+            return Some(v);
+        }
+    }
+    None
 }
 
 fn extract_date_hint(raw: &str) -> Option<String> {
@@ -363,5 +392,60 @@ mod tests {
         assert_eq!(market_mid_prob_yes(Some(45.0), Some(55.0)), Some(0.50));
         assert_eq!(market_mid_prob_yes(None, Some(55.0)), None);
         assert_eq!(market_mid_prob_yes(Some(45.0), None), None);
+    }
+
+    #[test]
+    fn threshold_extracted_from_ticker_t_prefix() {
+        // KXHIGHINFLATION-26DEC-T3.8 — old code grabbed 26 (date); new code gets 3.8
+        use super::extract_threshold_from_ticker;
+        assert_eq!(extract_threshold_from_ticker("KXHIGHINFLATION-26DEC-T3.8"), Some(3.8));
+        assert_eq!(extract_threshold_from_ticker("KXAIRFARECPI-26APR10-T310.0"), Some(310.0));
+        assert_eq!(extract_threshold_from_ticker("KXGOLDD-26MAR2517-T4400"), Some(4400.0));
+    }
+
+    #[test]
+    fn threshold_extracted_from_ticker_b_prefix() {
+        use super::extract_threshold_from_ticker;
+        assert_eq!(extract_threshold_from_ticker("KXBNB-26MAR2417-B537"), Some(537.0));
+        assert_eq!(extract_threshold_from_ticker("KXHYPE-26MAR2501-B61"), Some(61.0));
+    }
+
+    #[test]
+    fn threshold_from_ticker_not_confused_by_date_segment() {
+        // 26MAR24 should not be extracted as a threshold; the T/B segment should win
+        use super::extract_threshold_from_ticker;
+        let v = extract_threshold_from_ticker("KXNASDAQ100U-26MAR25H1200-T24539.99");
+        assert_eq!(v, Some(24539.99));
+    }
+
+    #[test]
+    fn threshold_from_ticker_none_when_no_tb_segment() {
+        use super::extract_threshold_from_ticker;
+        assert_eq!(extract_threshold_from_ticker("KXNBAGAME-26MAR24BOSNYC-BOS"), None);
+        assert_eq!(extract_threshold_from_ticker("KXTEST"), None);
+    }
+
+    #[test]
+    fn parse_market_metadata_uses_ticker_threshold_when_title_has_none() {
+        // Title has no number, so falls through to ticker extraction
+        let parsed = parse_market_metadata(
+            "KXHIGHINFLATION-26DEC-T3.8",
+            "Will inflation exceed target?",
+            None,
+            None,
+        );
+        assert_eq!(parsed.threshold_value, Some(3.8));
+    }
+
+    #[test]
+    fn parse_market_metadata_prefers_title_threshold_over_ticker() {
+        // Title clearly has the threshold; should not defer to ticker
+        let parsed = parse_market_metadata(
+            "KXHIGHINFLATION-26DEC-T3.8",
+            "Will inflation exceed 4.0%?",
+            None,
+            None,
+        );
+        assert_eq!(parsed.threshold_value, Some(4.0));
     }
 }

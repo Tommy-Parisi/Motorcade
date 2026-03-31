@@ -22,6 +22,8 @@ pub struct MarketStateEvent {
     pub spread_cents: Option<f64>,
     pub volume: f64,
     pub traded_count_delta: Option<f64>,
+    #[serde(default)]
+    pub finance_price_signal: Option<f64>,
     pub source: String,
     pub cycle_id: String,
 }
@@ -49,6 +51,10 @@ pub struct OrderLifecycleEvent {
     pub signal_origin: Option<String>,
     #[serde(default)]
     pub execution_mode: Option<String>,
+    /// Explicit provenance tag: true when this event was generated synthetically
+    /// (e.g. bootstrap rows). Takes precedence over magic-number heuristics.
+    #[serde(default)]
+    pub is_synthetic: bool,
     pub status: Option<OrderStatus>,
     pub event_type: String,
     pub error: Option<String>,

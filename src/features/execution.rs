@@ -9,7 +9,7 @@ use crate::research::events::OrderLifecycleEvent;
 
 pub const EXECUTION_FEATURE_SCHEMA_VERSION: &str = "v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionContext {
     pub open_order_count_same_ticker: u32,
     pub recent_fill_count_same_ticker: u32,
@@ -68,8 +68,25 @@ pub fn build_execution_feature_row_from_forecast(
     context: &ExecutionContext,
 ) -> ExecutionFeatureRow {
     let limit_cents = limit_price * 100.0;
-    let price_vs_best_bid_cents = market.yes_bid_cents.map(|bid| limit_cents - bid);
-    let price_vs_best_ask_cents = market.yes_ask_cents.map(|ask| limit_cents - ask);
+
+    // For NO trades, the relevant market side is flipped:
+    //   NO ask  = 100 - YES bid   (buying NO = selling YES)
+    //   NO bid  = 100 - YES ask
+    // Aggressiveness measures how far the limit price is from the side's own best ask,
+    // normalized by spread. Using YES prices for NO trades produces systematically wrong
+    // aggressiveness values (e.g. NO limit=1¢ vs YES ask=99¢ → appears as "deep miss"
+    // when the NO ask is actually 1¢ → "at market").
+    let (side_ask_cents, side_bid_cents) = if candidate.outcome_id.eq_ignore_ascii_case("no") {
+        (
+            market.yes_bid_cents.map(|b| 100.0 - b), // NO ask = 100 - YES bid
+            market.yes_ask_cents.map(|a| 100.0 - a), // NO bid = 100 - YES ask
+        )
+    } else {
+        (market.yes_ask_cents, market.yes_bid_cents)
+    };
+
+    let price_vs_best_bid_cents = side_bid_cents.map(|bid| limit_cents - bid);
+    let price_vs_best_ask_cents = side_ask_cents.map(|ask| limit_cents - ask);
     let aggressiveness_bps = market
         .spread_cents()
         .filter(|spread| *spread > 0.0)
@@ -217,5 +234,60 @@ mod tests {
         );
         assert_eq!(row.price_vs_best_bid_cents, Some(3.0));
         assert_eq!(row.price_vs_best_ask_cents, Some(-1.0));
+    }
+
+    #[test]
+    fn no_trade_aggressiveness_uses_no_side_prices() {
+        // YES bid=99, YES ask=100 → market near-resolved YES.
+        // NO ask = 100 - 99 = 1¢. Buying NO at 1¢ is "at market", not "deep_miss".
+        // The old code used YES prices: limit=1 vs YES ask=100 → -99¢ offset → deep_miss.
+        // The new code uses NO prices: limit=1 vs NO ask=1 → 0¢ offset → at_market.
+        let near_resolved = ScannedMarket {
+            ticker: "KXNBATOTAL-26MAR25LALIND-234".to_string(),
+            title: "NBA Total".to_string(),
+            subtitle: None,
+            market_type: None,
+            event_ticker: None,
+            series_ticker: None,
+            yes_bid_cents: Some(99.0),
+            yes_ask_cents: Some(100.0),
+            volume: 5000.0,
+            close_time: None,
+        };
+        let no_candidate = CandidateTrade {
+            ticker: "KXNBATOTAL-26MAR25LALIND-234".to_string(),
+            side: Side::Buy,
+            outcome_id: "no".to_string(),
+            fair_price: 0.42,
+            observed_price: 0.01,
+            edge_pct: 0.41,
+            confidence: 0.6,
+            rationale: "x".to_string(),
+        };
+        let row = build_execution_feature_row(
+            &near_resolved,
+            &no_candidate,
+            TimeInForce::Ioc,
+            0.01,  // limit = NO ask = 1¢
+            &ExecutionContext::default(),
+            Utc::now(),
+        );
+        // NO ask = 100 - YES bid = 100 - 99 = 1¢; limit = 1¢ → offset = 0
+        assert_eq!(row.price_vs_best_ask_cents, Some(0.0),
+            "NO limit at NO ask should have 0 offset, got {:?}", row.price_vs_best_ask_cents);
+        // NO bid = 100 - YES ask = 100 - 100 = 0¢; limit = 1¢ → offset = +1
+        assert_eq!(row.price_vs_best_bid_cents, Some(1.0));
+    }
+
+    #[test]
+    fn yes_trade_aggressiveness_unchanged() {
+        // YES side should still use YES prices directly.
+        let m = market(); // bid=68, ask=72
+        let c = candidate(); // outcome_id=yes, limit=0.70
+        let row = build_execution_feature_row(&m, &c, TimeInForce::Gtc, 0.70,
+            &ExecutionContext::default(), Utc::now());
+        // YES side: ask=72, limit=70 → offset = 70 - 72 = -2 (below ask)
+        assert_eq!(row.price_vs_best_ask_cents, Some(-2.0));
+        assert_eq!(row.price_vs_best_bid_cents, Some(2.0));
     }
 }

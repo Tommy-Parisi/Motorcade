@@ -667,6 +667,9 @@ scripts/run_research_capture.sh
 scripts/run_research_paper_capture.sh
 scripts/rebuild_models.sh
 scripts/morning_review.sh
+scripts/compare_execution_slices.sh
+scripts/run_organic_paper_collection.sh
+scripts/execution_data_report.sh
 ```
 
 Each script:
@@ -682,6 +685,9 @@ BOT_RUN_ONCE=true scripts/run_research_capture.sh
 BOT_RUN_ONCE=true scripts/run_research_paper_capture.sh
 BOT_CARGO_PROFILE=release scripts/rebuild_models.sh
 scripts/morning_review.sh
+scripts/compare_execution_slices.sh
+BOT_RUN_ONCE=true scripts/run_organic_paper_collection.sh
+scripts/execution_data_report.sh
 ```
 
 ### Overnight run
@@ -714,6 +720,12 @@ BOT_RUN_ONCE=true scripts/run_research_capture.sh
 BOT_RUN_ONCE=true scripts/run_research_paper_capture.sh
 ```
 
+### Run organic paper execution collection
+
+```bash
+BOT_RUN_ONCE=true scripts/run_organic_paper_collection.sh
+```
+
 ### Backfill outcomes
 
 ```bash
@@ -741,13 +753,25 @@ BOT_RUN_EXECUTION_TRAIN=true cargo run --quiet
 ### Generate model report
 
 ```bash
-scripts/morning_review.sh
+BOT_RUN_MODEL_REPORT=true cargo run --quiet
 ```
 
 ### Generate policy report
 
 ```bash
 BOT_RUN_POLICY_REPORT=true cargo run --quiet
+```
+
+Latest day only:
+
+```bash
+BOT_RUN_POLICY_REPORT=true BOT_POLICY_REPORT_DAY=$(date +%Y-%m-%d) cargo run --quiet
+```
+
+### Generate execution data source report
+
+```bash
+scripts/execution_data_report.sh
 ```
 
 ### Generate research report

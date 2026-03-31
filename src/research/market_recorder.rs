@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
+use std::collections::HashMap;
+
+use crate::data::market_enrichment::MarketEnrichment;
 use crate::data::market_scanner::{ScanTrace, ScannedMarket};
 use crate::execution::types::ExecutionError;
 use crate::research::events::{MarketStateEvent, RESEARCH_SCHEMA_VERSION};
@@ -35,6 +38,7 @@ pub fn record_scan_trace(
     cycle_id: &str,
     snapshot_markets: &[ScannedMarket],
     trace: &ScanTrace,
+    enrichments: Option<&HashMap<String, MarketEnrichment>>,
 ) -> Result<(), ExecutionError> {
     if !cfg.enabled {
         return Ok(());
@@ -42,10 +46,12 @@ pub fn record_scan_trace(
 
     let mut events = Vec::with_capacity(snapshot_markets.len() + trace.deltas.len());
     for market in snapshot_markets {
-        events.push(market_to_event(market, cycle_id, "snapshot", None));
+        let enrich = enrichments.and_then(|m| m.get(&market.ticker));
+        events.push(market_to_event(market, cycle_id, "snapshot", None, enrich));
     }
     for delta in &trace.deltas {
         if let Some(market) = trace.final_markets.iter().find(|m| m.ticker == delta.ticker) {
+            let enrich = enrichments.and_then(|m| m.get(&market.ticker));
             events.push(MarketStateEvent {
                 schema_version: RESEARCH_SCHEMA_VERSION.to_string(),
                 ts: delta.observed_at,
@@ -68,6 +74,7 @@ pub fn record_scan_trace(
                 ),
                 volume: market.volume,
                 traded_count_delta: delta.traded_count_delta,
+                finance_price_signal: enrich.and_then(|e| e.finance_price_signal),
                 source: "ws_delta".to_string(),
                 cycle_id: cycle_id.to_string(),
             });
@@ -82,6 +89,7 @@ fn market_to_event(
     cycle_id: &str,
     source: &str,
     traded_count_delta: Option<f64>,
+    enrichment: Option<&MarketEnrichment>,
 ) -> MarketStateEvent {
     MarketStateEvent {
         schema_version: RESEARCH_SCHEMA_VERSION.to_string(),
@@ -99,6 +107,7 @@ fn market_to_event(
         spread_cents: implied_spread_cents(market.yes_bid_cents, market.yes_ask_cents),
         volume: market.volume,
         traded_count_delta,
+        finance_price_signal: enrichment.and_then(|e| e.finance_price_signal),
         source: source.to_string(),
         cycle_id: cycle_id.to_string(),
     }

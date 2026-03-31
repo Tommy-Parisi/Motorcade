@@ -81,7 +81,7 @@ pub async fn run_dataset_build(cfg: &DatasetBuildConfig) -> Result<(), Execution
     let outcomes = load_outcomes(&cfg.research_dir)?;
 
     let forecast_rows = build_forecast_dataset(&market_events, &outcomes);
-    let execution_rows = build_execution_dataset(&market_events, &order_events);
+    let execution_rows = build_execution_dataset(&market_events, &order_events, &outcomes);
     let bootstrap_rows: Vec<_> = execution_rows
         .iter()
         .filter(|row| row.is_bootstrap_synthetic)
@@ -156,10 +156,31 @@ fn build_forecast_dataset(
     assign_splits_forecast(rows)
 }
 
+fn parse_window_secs_env(var: &str, default: &str) -> Vec<i64> {
+    std::env::var(var)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect()
+}
+
 fn build_execution_dataset(
     market_events: &[MarketStateEvent],
     order_events: &[OrderLifecycleEvent],
+    outcomes: &HashMap<String, MarketOutcomeRecord>,
 ) -> Vec<ExecutionTrainingRow> {
+    // Fill-target windows come from BOT_FILL_TARGET_WINDOWS_SECS (comma-separated secs).
+    // Defaults: 30s, 300s (5 min).
+    let fill_windows = parse_window_secs_env("BOT_FILL_TARGET_WINDOWS_SECS", "30,300");
+    let fill_window_0 = fill_windows.first().copied().unwrap_or(30);
+    let fill_window_1 = fill_windows.get(1).copied().unwrap_or(300);
+
+    // Markout windows come from BOT_MARKOUT_WINDOWS_SECS (comma-separated secs).
+    // Defaults: 300s (5 min), 1800s (30 min).
+    let markout_windows = parse_window_secs_env("BOT_MARKOUT_WINDOWS_SECS", "300,1800");
+    let markout_window_0 = markout_windows.first().copied().unwrap_or(300);
+    let markout_window_1 = markout_windows.get(1).copied().unwrap_or(1800);
+
     let market_index = build_market_index(market_events);
     let mut by_client_order_id: BTreeMap<String, Vec<OrderLifecycleEvent>> = BTreeMap::new();
     for event in order_events {
@@ -186,10 +207,14 @@ fn build_execution_dataset(
         );
         let terminal = events.iter().rev().find(|e| e.status.is_some());
         let filled_within_30s = events.iter().any(|e| {
-            e.filled_qty > 0.0 && (e.ts - intent.ts).num_seconds() >= 0 && (e.ts - intent.ts).num_seconds() <= 30
+            e.filled_qty > 0.0
+                && (e.ts - intent.ts).num_seconds() >= 0
+                && (e.ts - intent.ts).num_seconds() <= fill_window_0
         });
         let filled_within_5m = events.iter().any(|e| {
-            e.filled_qty > 0.0 && (e.ts - intent.ts).num_seconds() >= 0 && (e.ts - intent.ts).num_seconds() <= 300
+            e.filled_qty > 0.0
+                && (e.ts - intent.ts).num_seconds() >= 0
+                && (e.ts - intent.ts).num_seconds() <= fill_window_1
         });
         let terminal_status = terminal.and_then(|e| e.status).map(|s| format!("{:?}", s));
         let terminal_filled_qty = terminal.map(|e| e.filled_qty).unwrap_or(0.0);
@@ -203,9 +228,11 @@ fn build_execution_dataset(
             .and_then(|e| e.status)
             .map(|s| s == OrderStatus::Rejected)
             .unwrap_or(false);
-        let markout_bps_5m = compute_markout_bps(&market_index, intent, terminal_avg_fill_price, 300);
-        let markout_bps_30m = compute_markout_bps(&market_index, intent, terminal_avg_fill_price, 1800);
-        let realized_net_pnl = compute_realized_net_pnl(intent, terminal);
+        let markout_bps_5m =
+            compute_markout_bps(&market_index, intent, terminal_avg_fill_price, markout_window_0);
+        let markout_bps_30m =
+            compute_markout_bps(&market_index, intent, terminal_avg_fill_price, markout_window_1);
+        let realized_net_pnl = compute_realized_net_pnl(intent, terminal, outcomes);
 
         rows.push(ExecutionTrainingRow {
             schema_version: DATASET_SCHEMA_VERSION.to_string(),
@@ -352,7 +379,7 @@ fn classify_execution_source(
                 .unwrap_or(false)
         });
 
-    if is_paper && looks_like_bootstrap_synthetic(intent) {
+    if is_paper && intent.is_synthetic {
         return "bootstrap_synthetic".to_string();
     }
     if is_paper {
@@ -361,21 +388,6 @@ fn classify_execution_source(
     "live_real".to_string()
 }
 
-fn looks_like_bootstrap_synthetic(intent: &OrderLifecycleEvent) -> bool {
-    let fair = intent.signal_fair_price.unwrap_or(-1.0);
-    let observed = intent.signal_observed_price.unwrap_or(-1.0);
-    let edge = intent.signal_edge_pct.unwrap_or(-1.0);
-    let confidence = intent.signal_confidence.unwrap_or(-1.0);
-    let limit_price = intent.limit_price.unwrap_or(-1.0);
-    let qty = intent.requested_qty;
-
-    (limit_price - 0.02).abs() <= 0.000_001
-        && (qty - 303.030_303_030_303).abs() <= 0.01
-        && (fair - 0.04).abs() <= 0.000_001
-        && (observed - 0.01).abs() <= 0.000_001
-        && (edge - 0.03).abs() <= 0.000_001
-        && (confidence - 0.7).abs() <= 0.000_001
-}
 
 fn compute_markout_bps(
     market_index: &HashMap<String, Vec<MarketStateEvent>>,
@@ -399,18 +411,25 @@ fn compute_markout_bps(
 fn compute_realized_net_pnl(
     intent: &OrderLifecycleEvent,
     terminal: Option<&OrderLifecycleEvent>,
+    outcomes: &HashMap<String, MarketOutcomeRecord>,
 ) -> Option<f64> {
     let terminal = terminal?;
-    let fair = intent.signal_fair_price?;
     let fill = terminal.avg_fill_price?;
     let qty = terminal.filled_qty.max(0.0);
     let fee = terminal.fee_paid.unwrap_or(0.0).max(0.0);
-    let signed_unit = if intent.outcome_id.eq_ignore_ascii_case("yes") {
-        fair - fill
+    let outcome = outcomes.get(&intent.ticker)?;
+    if outcome.resolution_status == "canceled" {
+        return None;
+    }
+    let outcome_yes = outcome.outcome_yes?;
+    let is_yes_side = intent.outcome_id.eq_ignore_ascii_case("yes");
+    let winner = if is_yes_side { outcome_yes } else { !outcome_yes };
+    let pnl = if winner {
+        (1.0 - fill) * qty - fee
     } else {
-        fair - fill
+        -fill * qty - fee
     };
-    Some((signed_unit * qty) - fee)
+    Some(pnl)
 }
 
 fn event_root_from_ticker(ticker: &str) -> String {
@@ -594,7 +613,6 @@ mod tests {
             signal_confidence: None,
             signal_origin: Some("bootstrap_synthetic".to_string()),
             execution_mode: Some("paper".to_string()),
-            is_synthetic: false,
             status: None,
             event_type: "intent".to_string(),
             error: None,
@@ -625,7 +643,6 @@ mod tests {
             signal_confidence: None,
             signal_origin: Some("model_candidate".to_string()),
             execution_mode: Some("paper".to_string()),
-            is_synthetic: false,
             status: None,
             event_type: "intent".to_string(),
             error: None,
@@ -656,7 +673,6 @@ mod tests {
             signal_confidence: None,
             signal_origin: None,
             execution_mode: None,      // no execution_mode set
-            is_synthetic: false,
             status: None,
             event_type: "intent".to_string(),
             error: None,
@@ -693,7 +709,6 @@ mod tests {
             signal_confidence: None,
             signal_origin: Some("model_candidate".to_string()),
             execution_mode: Some("live".to_string()),
-            is_synthetic: false,
             status: Some(OrderStatus::Filled),
             event_type: "intent".to_string(),
             error: None,
@@ -713,7 +728,13 @@ mod tests {
                 label_resolution_status: "resolved".to_string(),
                 feature: ForecastFeatureRow {
                     schema_version: "v1".to_string(),
-                    feature_ts: Utc.timestamp_opt(i, 0).single().unwrap(),
+                    feature_ts: match Utc.timestamp_opt(i, 0).single() {
+                        Some(ts) => ts,
+                        None => {
+                            eprintln!("warning: skipping row with unparseable timestamp {i}");
+                            continue;
+                        }
+                    },
                     ticker: format!("T{i}"),
                     title: "x".to_string(),
                     subtitle: None,
@@ -746,5 +767,110 @@ mod tests {
         assert_eq!(rows[0].split, "train");
         assert_eq!(rows[8].split, "validation");
         assert_eq!(rows[9].split, "test");
+    }
+
+    fn make_intent(ticker: &str, outcome_id: &str) -> OrderLifecycleEvent {
+        OrderLifecycleEvent {
+            schema_version: "v1".to_string(),
+            ts: Utc::now(),
+            client_order_id: "c-test".to_string(),
+            order_id: None,
+            ticker: ticker.to_string(),
+            outcome_id: outcome_id.to_string(),
+            side: crate::execution::types::Side::Buy,
+            tif: crate::execution::types::TimeInForce::Gtc,
+            limit_price: None,
+            requested_qty: 10.0,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            fee_paid: None,
+            signal_fair_price: None,
+            signal_observed_price: None,
+            signal_edge_pct: None,
+            signal_confidence: None,
+            signal_origin: None,
+            execution_mode: None,
+            status: None,
+            event_type: "intent".to_string(),
+            error: None,
+        }
+    }
+
+    fn make_terminal(fill: f64, qty: f64, fee: f64) -> OrderLifecycleEvent {
+        OrderLifecycleEvent {
+            filled_qty: qty,
+            avg_fill_price: Some(fill),
+            fee_paid: Some(fee),
+            event_type: "fill".to_string(),
+            status: Some(crate::execution::types::OrderStatus::Filled),
+            ..make_intent("KXTEST-YES", "yes")
+        }
+    }
+
+    fn make_outcome(ticker: &str, outcome_yes: Option<bool>, status: &str) -> MarketOutcomeRecord {
+        MarketOutcomeRecord {
+            schema_version: "v1".to_string(),
+            ticker: ticker.to_string(),
+            resolved_at: Utc::now(),
+            outcome_yes,
+            resolution_status: status.to_string(),
+            source: "test".to_string(),
+            close_time: None,
+        }
+    }
+
+    #[test]
+    fn realized_pnl_yes_win() {
+        // YES buy at 0.40, YES wins → pnl = (1.0 - 0.40) * 10.0 - 0.05 = 5.95
+        let intent = make_intent("KXTEST-YES", "yes");
+        let terminal = make_terminal(0.40, 10.0, 0.05);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("KXTEST-YES".to_string(), make_outcome("KXTEST-YES", Some(true), "resolved"));
+        let pnl = compute_realized_net_pnl(&intent, Some(&terminal), &outcomes);
+        assert!((pnl.unwrap() - 5.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_yes_loss() {
+        // YES buy at 0.40, NO wins → pnl = -0.40 * 10.0 - 0.05 = -4.05
+        let intent = make_intent("KXTEST-YES", "yes");
+        let terminal = make_terminal(0.40, 10.0, 0.05);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("KXTEST-YES".to_string(), make_outcome("KXTEST-YES", Some(false), "resolved"));
+        let pnl = compute_realized_net_pnl(&intent, Some(&terminal), &outcomes);
+        assert!((pnl.unwrap() - (-4.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_no_win() {
+        // NO buy at 0.60, YES loses → NO wins → pnl = (1.0 - 0.60) * 10.0 - 0.05 = 3.95
+        let intent = make_intent("KXTEST-NO", "no");
+        let terminal = make_terminal(0.60, 10.0, 0.05);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("KXTEST-NO".to_string(), make_outcome("KXTEST-NO", Some(false), "resolved"));
+        let pnl = compute_realized_net_pnl(&intent, Some(&terminal), &outcomes);
+        assert!((pnl.unwrap() - 3.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_no_loss() {
+        // NO buy at 0.60, YES wins → NO loses → pnl = -0.60 * 10.0 - 0.05 = -6.05
+        let intent = make_intent("KXTEST-NO", "no");
+        let terminal = make_terminal(0.60, 10.0, 0.05);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("KXTEST-NO".to_string(), make_outcome("KXTEST-NO", Some(true), "resolved"));
+        let pnl = compute_realized_net_pnl(&intent, Some(&terminal), &outcomes);
+        assert!((pnl.unwrap() - (-6.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_canceled_returns_none() {
+        // canceled outcome → None
+        let intent = make_intent("KXTEST-YES", "yes");
+        let terminal = make_terminal(0.40, 10.0, 0.05);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("KXTEST-YES".to_string(), make_outcome("KXTEST-YES", None, "canceled"));
+        let pnl = compute_realized_net_pnl(&intent, Some(&terminal), &outcomes);
+        assert!(pnl.is_none());
     }
 }
