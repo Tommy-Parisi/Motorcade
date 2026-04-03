@@ -559,6 +559,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: Some(43.0),
             yes_ask_cents: Some(49.0),
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: 10_000.0,
             close_time: None,
         };
@@ -583,6 +585,8 @@ mod tests {
                 series_ticker: None,
                 yes_bid_cents: Some(40.0),
                 yes_ask_cents: Some(45.0),
+                yes_bid_size: None,
+                yes_ask_size: None,
                 volume: 1_000.0,
                 close_time: None,
             },
@@ -595,6 +599,8 @@ mod tests {
                 series_ticker: None,
                 yes_bid_cents: Some(20.0),
                 yes_ask_cents: Some(40.0),
+                yes_bid_size: None,
+                yes_ask_size: None,
                 volume: 5_000.0,
                 close_time: None,
             },
@@ -629,6 +635,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: None,
             yes_ask_cents: None,
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: 10_000.0,
             close_time: None,
         }];
@@ -656,6 +664,8 @@ mod tests {
             yes_ask: None,
             yes_bid_dollars: Some("0.43".to_string()),
             yes_ask_dollars: Some("0.49".to_string()),
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: Some("1234.00".to_string()),
             close_time: None,
         };
@@ -675,6 +685,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: Some(40.0),
             yes_ask_cents: Some(45.0),
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: 100.0,
             close_time: None,
         }]);
@@ -685,6 +697,8 @@ mod tests {
                 ticker: "KXBTC".to_string(),
                 yes_bid_cents: Some(41.0),
                 yes_ask_cents: Some(46.0),
+                yes_bid_size: None,
+                yes_ask_size: None,
                 traded_count_delta: Some(12.0),
             }],
         );
@@ -704,6 +718,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: Some(45.0),
             yes_ask_cents: Some(50.0),
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume,
             close_time: close_secs_from_now.map(|s| Utc::now() + chrono::Duration::seconds(s)),
         }

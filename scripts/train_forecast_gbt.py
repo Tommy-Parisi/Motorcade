@@ -19,7 +19,9 @@ Outputs:
 """
 
 import argparse
+import datetime
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -161,6 +163,68 @@ def print_metrics(tag, preds, labels, baseline_preds):
     print(f"  {tag}:")
     print(f"    Brier score  : {bs:.5f}  (market mid: {bs_mid:.5f},  skill: {bss:+.3f})")
     print(f"    Log loss     : {ll:.5f}")
+
+
+# ---------------------------------------------------------------------------
+# Rust artifact helpers
+# ---------------------------------------------------------------------------
+
+def get_base_score_margin(booster):
+    """Return base score in logit (margin) space for Rust tree summation.
+
+    XGBoost 2.x stores base_score in probability space in save_config().
+    Rust inference needs the logit-space value so it can do:
+        sigmoid(base_score_margin + sum(leaf_values))
+    """
+    try:
+        config = json.loads(booster.save_config())
+        bs = float(config["learner"]["learner_model_param"]["base_score"])
+        bs = max(1e-7, min(1.0 - 1e-7, bs))
+        return math.log(bs / (1.0 - bs))
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return 0.0  # logit(0.5) = 0 — safe default
+
+
+def flatten_tree(tree_dict, feature_names):
+    """Convert a recursive XGBoost tree dict to a flat node list sorted by nodeid.
+
+    Each node becomes:
+      {"is_leaf": bool, "feature_idx": int, "split_condition": float,
+       "yes": int, "no": int, "missing": int, "leaf_value": float}
+
+    Internal nodes set leaf_value=0.0; leaf nodes set feature_idx/yes/no/missing=0.
+    """
+    nodes = {}
+
+    def traverse(node):
+        nid = node["nodeid"]
+        if "leaf" in node:
+            nodes[nid] = {
+                "is_leaf": True,
+                "feature_idx": 0,
+                "split_condition": 0.0,
+                "yes": 0,
+                "no": 0,
+                "missing": 0,
+                "leaf_value": float(node["leaf"]),
+            }
+        else:
+            feat = node["split"]
+            feat_idx = feature_names.index(feat) if feat in feature_names else 0
+            nodes[nid] = {
+                "is_leaf": False,
+                "feature_idx": feat_idx,
+                "split_condition": float(node["split_condition"]),
+                "yes": int(node["yes"]),
+                "no": int(node["no"]),
+                "missing": int(node["missing"]),
+                "leaf_value": 0.0,
+            }
+            for child in node.get("children", []):
+                traverse(child)
+
+    traverse(tree_dict)
+    return [nodes[i] for i in sorted(nodes.keys())]
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +401,52 @@ def main():
     with open(eval_path, "w") as fh:
         json.dump(eval_meta, fh, indent=2)
     print(f"Saved eval   → {eval_path}")
+
+    # Save Rust-loadable artifact (loaded by BOT_MODEL_FORECAST_PATH at runtime)
+    # Format mirrors ForecastModelArtifact in src/models/forecast.rs with an added
+    # `gbt` field containing the flattened tree array and category encodings.
+    model_version = f"xgb-{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+    dump_strs = model.get_dump(dump_format="json")
+    trees = [flatten_tree(json.loads(s), ALL_FEATURES) for s in dump_strs]
+    base_score = get_base_score_margin(model)
+    test_bs_mid = brier_score(test_mids, y_test)
+    rust_artifact = {
+        "schema_version": "v1",
+        "model_kind": "xgboost_gbt",
+        "model_version": model_version,
+        "trained_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "train_rows": len(train_rows),
+        "validation_rows": len(val_rows),
+        "test_rows": len(test_rows),
+        "feature_schema_version": "v1",
+        "metrics": {
+            "validation_brier": float(val_bs),
+            "validation_market_mid_brier": float(bs_mid_val),
+            "test_brier": float(test_bs),
+            "test_market_mid_brier": float(test_bs_mid),
+        },
+        "gbt": {
+            "feature_names": ALL_FEATURES,
+            "category_maps": cat_maps,
+            "base_score": base_score,
+            "trees": trees,
+        },
+        # Empty bucket fields — required by ForecastModelArtifact serde schema
+        "global": {"positives": 0.0, "total": 0.0},
+        "vertical": {},
+        "vertical_direction": {},
+        "vertical_entity": {},
+        "vertical_threshold": {},
+    }
+    rust_path = out_dir / "xgb_v1_rust.json"
+    with open(rust_path, "w") as fh:
+        json.dump(rust_artifact, fh)
+    print(f"Saved Rust artifact → {rust_path}  ({len(trees)} trees, base_score={base_score:.6f})")
+
+    latest_path = out_dir / "latest.json"
+    with open(latest_path, "w") as fh:
+        json.dump(rust_artifact, fh)
+    print(f"Updated latest.json → {model_version}")
 
     # Verdict
     print("\n" + "=" * 60)

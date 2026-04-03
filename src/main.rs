@@ -2458,6 +2458,7 @@ mod tests {
                 vertical_direction: std::collections::HashMap::new(),
                 vertical_entity: std::collections::HashMap::new(),
                 vertical_threshold: std::collections::HashMap::new(),
+                gbt: None,
             },
             5,
         )
