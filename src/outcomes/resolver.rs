@@ -198,7 +198,12 @@ fn load_existing_outcomes(cfg: &OutcomeResolverConfig) -> Result<BTreeSet<String
             continue;
         }
         if let Ok(record) = serde_json::from_str::<MarketOutcomeRecord>(line) {
-            out.insert(record.ticker);
+            // Only mark as done if we have a definitive result; outcome_yes=None means
+            // the market was seen as "resolved" but the result field was missing at fetch
+            // time. Re-fetch it so we can capture the actual yes/no outcome.
+            if record.outcome_yes.is_some() || record.resolution_status == "canceled" {
+                out.insert(record.ticker);
+            }
         }
     }
     Ok(out)
