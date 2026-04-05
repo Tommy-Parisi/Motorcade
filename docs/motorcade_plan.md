@@ -11,7 +11,7 @@ The better architecture is a **motorcade**: the Rust bot runs in the center, fla
 | Component | Status |
 |-----------|--------|
 | Data infrastructure (market state, order lifecycle, outcomes, feature builder) | Done |
-| Weather specialist sidecar (`KXHIGHPHI-*`, AUC 0.9959) | **Live** |
+| Weather specialist sidecar (`KXHIGHPHI-*`, AUC 0.9959) | **THIS MIGHT BE MISLEADING AND SHOULD MAKE US NERVOUS --> INFLATED, SEE ../WeatherPredictor/next_steps.md before expanding to other cities** |
 | General forecast GBT (`xgb_v1.ubj`) | Trained, BSS -2.64 — not wired, deprioritized |
 | Execution model | Bucket lookup table — no GBT yet |
 | Policy layer | Wired in shadow mode |
@@ -43,11 +43,27 @@ The bot is running in shadow. Legacy path executes. Specialist prob overrides bu
 ```
 
 **Rules:**
-- Each sidecar is a FastAPI service with a single `/predict?ticker=` endpoint
+- Each sidecar is a FastAPI service with `/health` and `/predict?ticker=` endpoints
 - `src/data/market_enrichment.rs` detects vertical from ticker, calls appropriate sidecar
 - `src/models/forecast.rs` uses `specialist_prob_yes` as a hard override when present
 - Sidecar down = silent fallback to bucket model, trading continues
 - New sidecars require: ticker parser, data fetcher, feature generator, trained XGBoost, `sidecar.py`
+
+**Sidecar response contract:**
+
+All sidecars must return:
+```json
+{
+  "probability": 0.62,
+  "data_age_secs": 180,
+  "data_source_ok": true,
+  "model_version": "v2"
+}
+```
+
+`fetch_specialist_prob` in `market_enrichment.rs` suppresses the result to `None` if `data_source_ok == false` or `data_age_secs` exceeds a per-vertical threshold. This ensures "sidecar up but returning garbage" (stale model, blocked scraper, bad data pull) collapses to `None` rather than silently overriding the forecast. Each vertical sets its own staleness threshold to match its data cadence (e.g. weather: 2h, crypto: 5m, FRED: 48h).
+
+This is additive — the existing weather sidecar just needs `data_source_ok: true` and `data_age_secs` added to its response.
 
 ---
 
@@ -68,10 +84,12 @@ Each one of those 169 corrected forecasts is a vote for what the high will be. I
 
 **Goal:** Cover `KXBTCD-*`, `KXETHD-*` and any similar threshold-crossing crypto markets.
 
+**Reference:** [khuangaf/CryptocurrencyPrediction](https://github.com/khuangaf/CryptocurrencyPrediction) — well-starred multi-coin deep learning repo covering LSTM/RNN architectures. Use as a base for the sequence model; adapt to threshold-crossing binary classification rather than price regression.
+
 **What to build** (`../kalshi_stack/CryptoPredictor/`, mirrors WeatherPredictor structure):
 - Exchange price fetcher (Binance/Coinbase REST, no auth required)
 - Feature generator: current price vs. threshold distance, rolling realized vol (1h/4h/24h), price momentum, funding rate, open interest delta, time to close
-- XGBoost binary classifier (will price close above threshold at market resolution?)
+- XGBoost binary classifier as the initial model (will price close above threshold at market resolution?); LSTM signal from khuangaf as a secondary feature input once validated
 - FastAPI sidecar with `/health` and `/predict?ticker=` endpoints
 - Ticker parser: `KXBTCD-26APR15-T95000` → asset=BTC, threshold=95000, date=Apr 15
 
@@ -101,7 +119,7 @@ Priority order:
 - Add to `MarketStateEvent` schema and populate from scanner/WS delta
 - Re-run retroactive label generation after a few weeks of richer snapshots
 
-**Gate:** Dataset has >10K rows with non-zero `raw_edge_pct`, plus real fill rows from at least one external source.
+**Gate:** All three gaps closed AND dataset has >10K rows with non-zero `raw_edge_pct`, plus real fill rows from at least one external source. Gap 2 (real fills) and Gap 3 (book depth) must both be resolved — hitting the row count while either gap remains open does not pass this gate.
 
 ---
 
@@ -173,19 +191,38 @@ Extend the validation checklist before promoting:
 
 **Economic indicators (Fed rate, CPI)**
 - Start with Fed rate markets only — thickest, cleanest structure
-- Data: CME FedWatch (implied rates), FRED API (prior prints + revisions)
 - Harder to beat efficient market without proprietary data edge — only build if there's a clear signal hypothesis
 
+Two reference implementations identified:
+
+**hawkwatchers** ([jgdenby/hawkwatchers](https://github.com/jgdenby/hawkwatchers)) — NLP classification on Fed press release text (Naive Bayes, Logistic Regression, SVM, Decision Trees, trained on releases back to 1994). Lighter weight; good as a quick signal layer that can be stood up quickly.
+
+**FOMC multi-agent system** ([chirindaopensource/multi_agent_system_architecture_for_federal_funds_target_rate_prediction](https://github.com/chirindaopensource/multi_agent_system_architecture_for_federal_funds_target_rate_prediction)) — more rigorous. Based on a solid paper; repo is scaffolding, not a validated tool. The parts worth adapting: FRED macroeconomic indicator ingestion pipeline, CoD prompt engineering, and meeting packet construction with proper information cutoffs. Approach: fork it, replace `generate_synthetic_datasets()` with real FRED API calls, validate output against a few known FOMC meetings before trusting it for live signals.
+
+Suggested build order: hawkwatchers as a fast first signal, FOMC multi-agent as a heavier second layer once the lighter one is validated in shadow.
+
 **Sports**
-- Blocked until a reliable, timely injury feed is identified
-- Without sub-hour injury data, model just replicates market mid
-- Do not schedule until data sourcing is solved
+- Data sourcing approach identified: **[vladkens/twscrape](https://github.com/vladkens/twscrape)** monitoring a curated beat reporter watchlist (~50 reporters per sport: Shams, Woj, Ian Rapoport, etc.), polling timelines every 60s, Claude classifying each tweet ("is this injury news, and which Kalshi markets does it affect?"), per-ticker probability updated on event fire
+- Unblocked in principle; implementation pending
+- Primary remaining risk: cycle latency (see transport note below) and per-ticker TTL correctness
+
+**Transport: polling with internal state, but cycle latency matters**
+The sports sidecar should maintain a per-ticker probability that it updates internally when a tweet or injury event fires. The Rust bot polls it on the normal cycle via `GET /predict?ticker=` and gets the sidecar's current best estimate — no new code path in `market_enrichment.rs`, no locking complexity from mid-cycle push events.
+
+However: if the current cycle is 30s, a tweet that lands just after a poll means up to 30s before the sidecar is queried again. For a market that reprices in 2-3 minutes (e.g. Shams tweets "Tatum out" at 6:58pm, tip-off 7:00pm), that's a meaningful fraction of the edge window. Verify the actual cycle interval before assuming polling is acceptable. If the edge window is tighter than the cycle, push is the right call — a signal channel into the main loop is the complexity cost.
+
+**Per-ticker state must have explicit TTLs**
+`data_age_secs` in the response contract handles "the data source went down or returned stale data." It does not handle "the signal was valid at the time but is now wrong." A sidecar that sets `KXNBA-BOS-*` to 0.3 because Tatum is out tonight must reset that state after the game resolves — otherwise tomorrow's market inherits yesterday's injury signal with a fresh `data_age_secs`.
+
+Each per-ticker probability entry needs a `valid_until` timestamp (e.g. game tip-off + a buffer, or market close time), not just a data freshness check. On `/predict`, if `valid_until` is in the past, return `data_source_ok: false` so the Rust side suppresses to `None`. Do not conflate data freshness with signal validity — they expire on different clocks.
 
 ---
 
 ## What the General Forecast GBT Becomes
 
-`var/models/forecast/xgb_v1.ubj` and `scripts/train_forecast_gbt.py` are not deleted — they serve as the fallback for markets no specialist covers (thin misc markets, new verticals). Retrain it only after specialists cover the main volume verticals (weather + crypto) and enrichment signals are actually populating for the remaining rows. Its role shrinks permanently as specialist coverage grows.
+`var/models/forecast/xgb_v1.ubj` has BSS -2.64 — worse than market mid. It is **not** the active fallback for non-specialist markets. The bucket model is the current fallback and is preferable to `xgb_v1.ubj` until the GBT is retrained on rows with real enrichment signals. `src/models/forecast.rs` should reflect this: `xgb_v1.ubj` must not be used as a fallback while its skill score is negative.
+
+`var/models/forecast/xgb_v1.ubj` and `scripts/train_forecast_gbt.py` are not deleted. Retrain only after specialists cover the main volume verticals (weather + crypto) and enrichment signals are actually populating for the remaining rows. Its role shrinks permanently as specialist coverage grows.
 
 ---
 
@@ -204,4 +241,3 @@ Extend the validation checklist before promoting:
 
 - Multi-exchange routing
 - Automatic retraining (manual batch retrain is sufficient)
-- Sports specialist until injury data sourcing is solved
