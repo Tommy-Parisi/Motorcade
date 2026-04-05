@@ -292,7 +292,8 @@ impl MarketEnricher {
     }
 
     /// Call the WeatherPredictor sidecar for a calibrated P(high_temp > threshold).
-    /// Returns None on any error so a down sidecar never blocks a trading cycle.
+    /// Returns None on any error, or when the sidecar signals data_source_ok=false,
+    /// so a down or stale sidecar never blocks a trading cycle.
     async fn fetch_specialist_prob(&self, ticker: &str) -> Option<f64> {
         let base_url = self.cfg.weather_specialist_url.as_deref()?;
         let url = format!("{}/predict?ticker={}", base_url, ticker);
@@ -305,9 +306,23 @@ impl MarketEnricher {
         match resp {
             Ok(r) if r.status().is_success() => {
                 #[derive(serde::Deserialize)]
-                struct SpecialistResp { prob: f64 }
+                struct SpecialistResp {
+                    probability:    f64,
+                    data_source_ok: bool,
+                    data_age_secs:  i64,
+                }
                 match r.json::<SpecialistResp>().await {
-                    Ok(body) => Some(body.prob.clamp(0.001, 0.999)),
+                    Ok(body) if body.data_source_ok && body.data_age_secs >= 0 => {
+                        Some(body.probability.clamp(0.001, 0.999))
+                    }
+                    Ok(body) => {
+                        eprintln!(
+                            "specialist suppressed for {ticker}: \
+                             data_source_ok={} age={}s",
+                            body.data_source_ok, body.data_age_secs
+                        );
+                        None
+                    }
                     Err(e) => {
                         eprintln!("specialist parse error for {ticker}: {e}");
                         None

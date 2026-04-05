@@ -26,6 +26,10 @@ pub struct MarketStateEvent {
     pub traded_count_delta: Option<f64>,
     #[serde(default)]
     pub finance_price_signal: Option<f64>,
+    /// Calibrated probability from the specialist sidecar (e.g. WeatherPredictor).
+    /// None when no specialist is configured or the sidecar returned data_source_ok=false.
+    #[serde(default)]
+    pub specialist_prob_yes: Option<f64>,
     pub source: String,
     pub cycle_id: String,
 }

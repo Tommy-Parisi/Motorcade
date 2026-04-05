@@ -77,6 +77,7 @@ pub fn record_scan_trace(
                 volume: market.volume,
                 traded_count_delta: delta.traded_count_delta,
                 finance_price_signal: enrich.and_then(|e| e.finance_price_signal),
+                specialist_prob_yes: enrich.and_then(|e| e.specialist_prob_yes),
                 source: "ws_delta".to_string(),
                 cycle_id: cycle_id.to_string(),
             });
@@ -112,6 +113,7 @@ fn market_to_event(
         volume: market.volume,
         traded_count_delta,
         finance_price_signal: enrichment.and_then(|e| e.finance_price_signal),
+        specialist_prob_yes: enrichment.and_then(|e| e.specialist_prob_yes),
         source: source.to_string(),
         cycle_id: cycle_id.to_string(),
     }
