@@ -55,7 +55,7 @@ impl Default for ValuationConfig {
             batch_size: 32,
             max_retries: 2,
             timeout_ms: 8_000,
-            max_tokens_per_batch: 4_096,
+            max_tokens_per_batch: 2_000,
             max_prompt_chars: 32_000,
             cache_ttl_secs: 600,
             mispricing_threshold: 0.08,
@@ -146,11 +146,6 @@ impl ValuationConfig {
         if let Ok(v) = std::env::var("BOT_VALUATION_TIMEOUT_MS") {
             if let Ok(parsed) = v.parse::<u64>() {
                 cfg.timeout_ms = parsed.max(100);
-            }
-        }
-        if let Ok(v) = std::env::var("BOT_VALUATION_MAX_TOKENS") {
-            if let Ok(parsed) = v.parse::<u32>() {
-                cfg.max_tokens_per_batch = parsed.max(256);
             }
         }
         if let Ok(v) = std::env::var("BOT_ALLOW_HEURISTIC_IN_LIVE") {
@@ -895,8 +890,6 @@ mod tests {
                 series_ticker: None,
                 yes_bid_cents: Some(mid_bid),
                 yes_ask_cents: Some(mid_ask),
-                yes_bid_size: None,
-                yes_ask_size: None,
                 volume: 10_000.0,
                 close_time: None,
             },

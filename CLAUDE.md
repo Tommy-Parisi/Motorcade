@@ -75,15 +75,9 @@ The entire `var/` tree (`cycles/`, `logs/`, `research/`, `features/`, `models/`,
 
 See `docs/execution_aware_prediction_plan.md` for the full roadmap. Post shadow-mode post-mortem (2026-03-29):
 
-**Fixed (2026-03-30):**
-- ~~**Issue 5:** Sports outcome resolver not capturing sports markets.~~ Fixed: order_lifecycle source now scans the full history without a date cutoff so all sports fills are collected. (`src/outcomes/resolver.rs`)
-- ~~**Issue 3:** `label_realized_net_pnl` computed theoretical entry edge, not actual resolution PnL.~~ Fixed: function now joins to outcomes by ticker and computes actual win/loss PnL for each side. (`src/datasets/builder.rs`)
-- ~~**Issue 6:** Allocator used legacy `fair_price` for Kelly sizing even in active mode.~~ Fixed: `chosen_fair_price` (forecast-derived) is now stored on `PolicyDecision` and applied to the Kelly candidate in active mode. (`src/policy/decision.rs`, `src/main.rs`)
-- ~~**Issue 7:** No shadow calibration gate before shadow→active promotion.~~ Fixed: `validate_shadow_calibration()` now blocks active mode if shadow data is insufficient or mean expected PnL is below threshold. (`src/main.rs`)
-
-**Remaining:**
 1. **Issue 4:** Execution model is 99.4% synthetic data (246K synthetic vs 1.4K organic rows). Accumulate more organic paper fills before relying on execution model predictions.
-2. **Issues 1 & 2:** Both models are bucket lookup tables, not GBTs. Forecast correction capped at ±1.4 cents from mid. Fix: train real GBT models offline (LightGBM/XGBoost) once data foundation is solid (requires Issue 3 data to be meaningful).
+2. **Issue 1 (Forecast GBT — not yet wired in):** A GBT training script exists (`scripts/train_forecast_gbt.py`) and a trained XGBoost artifact is at `var/models/forecast/xgb_v1.ubj`. However, the Rust inference layer (`src/models/forecast.rs`) still uses the empirical shrinkage bucket model — the XGBoost model has not been wired into serving. The trained model currently has a **negative Brier skill score (-2.64 val)** — worse than market mid — because early stopping triggered at round 5. Root cause: enrichment signals (`weather_signal`, `crypto_sentiment_signal`, `sports_injury_signal`) are null in most training rows, leaving the model with almost no signal beyond what mid_prob_yes already captures. Fix: ensure enrichment signals are being collected during live capture before retraining, then wire inference into Rust once skill score is positive.
+3. **Issue 2 (Execution GBT — not started):** Execution model remains a bucket lookup table (`empirical_execution_baseline`). No GBT training script exists for execution yet. Do not prioritize until Issue 1 is resolved and organic execution data is sufficient.
 
 ## Important Files
 
@@ -99,6 +93,8 @@ See `docs/execution_aware_prediction_plan.md` for the full roadmap. Post shadow-
 | `docs/execution_aware_prediction_plan.md` | Full modeling roadmap |
 | `scripts/evaluate_shadow.py` | Forecast calibration + policy hit-rate analysis |
 | `scripts/check_fills.py` | Paper fill win/loss rate vs resolved outcomes |
+| `scripts/train_forecast_gbt.py` | Offline XGBoost forecast training (not yet wired into Rust serving) |
+| `var/models/forecast/xgb_v1.ubj` | Trained XGBoost artifact (currently underperforms market mid — see Issue 1) |
 
 ## Analysis Scripts (Python)
 

@@ -21,6 +21,10 @@ pub struct EnrichmentConfig {
     /// a `title` query param and return `{"signal": <f64 in [-1,1]>}` where +1 means
     /// the market's stated team is heavily favoured. Set via ESPORTS_API_URL.
     pub esports_api_url: Option<String>,
+    /// Optional URL of the WeatherPredictor sidecar (e.g. http://127.0.0.1:8765).
+    /// When set, Philadelphia high-temp markets get a calibrated XGBoost probability
+    /// instead of the raw NOAA temperature signal. Set via WEATHER_SPECIALIST_URL.
+    pub weather_specialist_url: Option<String>,
 }
 
 impl Default for EnrichmentConfig {
@@ -34,6 +38,7 @@ impl Default for EnrichmentConfig {
                 .ok()
                 .or_else(|| Some("https://api.alternative.me/fng/?limit=1".to_string())),
             esports_api_url: std::env::var("ESPORTS_API_URL").ok(),
+            weather_specialist_url: std::env::var("WEATHER_SPECIALIST_URL").ok(),
         }
     }
 }
@@ -56,6 +61,11 @@ pub struct MarketEnrichment {
     /// (current_price - threshold) / (threshold * 0.02), clamped to [-1, 1].
     /// Covers indices, commodities, forex. Fetched from Yahoo Finance (no key required).
     pub finance_price_signal: Option<f64>,
+    /// Calibrated XGBoost probability from the WeatherPredictor sidecar.
+    /// Only populated for supported cities (currently Philadelphia) when
+    /// WEATHER_SPECIALIST_URL is configured. Used as a direct fair_prob_yes
+    /// override in the forecast layer, bypassing the general bucket model.
+    pub specialist_prob_yes: Option<f64>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -118,10 +128,24 @@ impl MarketEnricher {
         let mut crypto_price_signal = None;
         let mut esports_signal = None;
         let mut finance_price_signal = None;
+        let mut specialist_prob_yes = None;
 
         match vertical {
             MarketVertical::Weather => {
                 weather_signal = self.fetch_noaa_weather_signal(&market.ticker).await?;
+                // For Philadelphia high-temp markets, call the specialist sidecar when configured.
+                // Falls back silently so a down sidecar never blocks a trading cycle.
+                if self.cfg.weather_specialist_url.is_some() {
+                    let city = extract_city_from_ticker(&market.ticker)
+                        .map(|s| s.to_ascii_uppercase());
+                    let is_philly = matches!(
+                        city.as_deref(),
+                        Some("PHI") | Some("PHIL") | Some("PHILLY") | Some("PHL")
+                    );
+                    if is_philly {
+                        specialist_prob_yes = self.fetch_specialist_prob(&market.ticker).await;
+                    }
+                }
             }
             MarketVertical::Sports => {
                 sports_injury_signal = match self.fetch_sports_injury_signal().await {
@@ -178,6 +202,7 @@ impl MarketEnricher {
             crypto_price_signal,
             esports_signal,
             finance_price_signal,
+            specialist_prob_yes,
             generated_at: Utc::now(),
         };
         self.put_cached(&market.ticker, enriched.clone());
@@ -264,6 +289,40 @@ impl MarketEnricher {
             .and_then(|mut v| v.drain(..).next())
             .and_then(|p| p.temperature);
         Ok(temp)
+    }
+
+    /// Call the WeatherPredictor sidecar for a calibrated P(high_temp > threshold).
+    /// Returns None on any error so a down sidecar never blocks a trading cycle.
+    async fn fetch_specialist_prob(&self, ticker: &str) -> Option<f64> {
+        let base_url = self.cfg.weather_specialist_url.as_deref()?;
+        let url = format!("{}/predict?ticker={}", base_url, ticker);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct SpecialistResp { prob: f64 }
+                match r.json::<SpecialistResp>().await {
+                    Ok(body) => Some(body.prob.clamp(0.001, 0.999)),
+                    Err(e) => {
+                        eprintln!("specialist parse error for {ticker}: {e}");
+                        None
+                    }
+                }
+            }
+            Ok(r) => {
+                eprintln!("specialist HTTP {} for {ticker}", r.status());
+                None
+            }
+            Err(e) => {
+                eprintln!("specialist unavailable for {ticker}: {e}");
+                None
+            }
+        }
     }
 
     async fn fetch_sports_injury_signal(&self) -> Result<Option<f64>, ExecutionError> {
@@ -545,7 +604,7 @@ fn city_coords(city_code: &str) -> Option<&'static str> {
         "MIN" | "MSP" => Some("44.9778,-93.2650"),  // Minneapolis
         "NYC" | "NY"  => Some("40.7128,-74.0060"),  // New York City
         "ORL" => Some("28.5383,-81.3792"),   // Orlando
-        "PHI" => Some("39.9526,-75.1652"),   // Philadelphia
+        "PHI" | "PHIL" | "PHILLY" | "PHL" => Some("39.9526,-75.1652"),   // Philadelphia
         "PHX" => Some("33.4484,-112.0740"),  // Phoenix
         "PIT" => Some("40.4406,-79.9959"),   // Pittsburgh
         "PDX" => Some("45.5051,-122.6750"),  // Portland
@@ -807,8 +866,6 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: None,
             yes_ask_cents: None,
-            yes_bid_size: None,
-            yes_ask_size: None,
             volume: 0.0,
             close_time: None,
         };
@@ -821,8 +878,6 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: None,
             yes_ask_cents: None,
-            yes_bid_size: None,
-            yes_ask_size: None,
             volume: 0.0,
             close_time: None,
         };
@@ -964,8 +1019,6 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: Some(45.0),
             yes_ask_cents: Some(50.0),
-            yes_bid_size: None,
-            yes_ask_size: None,
             volume,
             close_time: None,
         }

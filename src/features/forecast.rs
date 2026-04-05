@@ -42,6 +42,9 @@ pub struct ForecastFeatureRow {
     pub sports_injury_signal: Option<f64>,
     pub crypto_sentiment_signal: Option<f64>,
     pub finance_price_signal: Option<f64>,
+    /// Calibrated probability from the WeatherPredictor specialist sidecar.
+    /// Present only for supported cities (Philadelphia) when sidecar is running.
+    pub specialist_prob_yes: Option<f64>,
     pub entity_primary: Option<String>,
     pub entity_secondary: Option<String>,
     pub threshold_value: Option<f64>,
@@ -87,6 +90,7 @@ pub fn build_forecast_feature_row(
         sports_injury_signal: enrichment.and_then(|e| e.sports_injury_signal),
         crypto_sentiment_signal: enrichment.and_then(|e| e.crypto_sentiment_signal),
         finance_price_signal: enrichment.and_then(|e| e.finance_price_signal),
+        specialist_prob_yes: enrichment.and_then(|e| e.specialist_prob_yes),
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,
@@ -129,6 +133,7 @@ pub fn build_forecast_feature_row_from_event(event: &MarketStateEvent) -> Foreca
         sports_injury_signal: None,
         crypto_sentiment_signal: None,
         finance_price_signal: event.finance_price_signal,
+        specialist_prob_yes: None,
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,

@@ -38,15 +38,14 @@ export BOT_CLAUDE_TRIGGER_MODE="on_heuristic_candidates"
 export BOT_VALUATION_CACHE_TTL_SECS="60"
 
 # --- PERIODIC BACKGROUND TASKS ---
-# These env vars are NOT exported — if set, main.rs treats them as standalone early-exit modes.
-# The main loop runs backfill/dataset-build at cycle % 18 unconditionally; no flag needed.
+# Enable periodic outcome backfill and dataset building in the main loop
+export BOT_RUN_OUTCOME_BACKFILL="true"
+export BOT_RUN_DATASET_BUILD="true"
 export BOT_OUTCOME_LOOKBACK_DAYS="14"
 
 # --- Execution & Capture Configuration ---
 export BOT_EXECUTION_MODE="paper"
-# BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY is NOT set — that mode hardcodes forecast_model=None,
-# bypassing shadow policy entirely. The full bot loop runs paper mode + shadow when
-# BOT_POLICY_MODE=shadow (set in .env).
+export BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY="true"
 export BOT_CARGO_PROFILE="release"
 export BOT_CYCLE_SECONDS="600" 
 

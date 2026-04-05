@@ -115,32 +115,6 @@ pub struct ForecastShadowRecord {
     pub model_version: String,
 }
 
-/// One node in a flattened XGBoost tree (sorted by nodeid).
-/// Internal nodes: is_leaf=false, leaf_value=0. Leaf nodes: is_leaf=true, feature_idx/yes/no/missing=0.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GbtNode {
-    pub is_leaf: bool,
-    pub feature_idx: usize,
-    pub split_condition: f32,
-    pub yes: usize,
-    pub no: usize,
-    pub missing: usize,
-    pub leaf_value: f32,
-}
-
-/// GBT model data embedded inside ForecastModelArtifact when model_kind == "xgboost_gbt".
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct XgboostGbtData {
-    /// Feature names in the order the tree nodes reference by index.
-    pub feature_names: Vec<String>,
-    /// Category label encodings: feature_name → {string_value → int_code}.
-    pub category_maps: HashMap<String, HashMap<String, i64>>,
-    /// Base score in logit (margin) space. Prediction = sigmoid(base_score + sum(leaf_values)).
-    pub base_score: f64,
-    /// One flat node list per tree, sorted by nodeid.
-    pub trees: Vec<Vec<GbtNode>>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForecastModelArtifact {
     pub schema_version: String,
@@ -157,9 +131,6 @@ pub struct ForecastModelArtifact {
     pub vertical_direction: HashMap<String, RateBucket>,
     pub vertical_entity: HashMap<String, RateBucket>,
     pub vertical_threshold: HashMap<String, RateBucket>,
-    /// Present when model_kind == "xgboost_gbt". Absent for bucket models.
-    #[serde(default)]
-    pub gbt: Option<XgboostGbtData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -228,13 +199,21 @@ impl ForecastModel {
     }
 
     pub fn predict(&self, feature: &ForecastFeatureRow) -> ForecastOutput {
-        if let Some(gbt) = &self.artifact.gbt {
-            return self.predict_gbt(feature, gbt);
+        // Specialist override: when the WeatherPredictor sidecar produced a calibrated
+        // probability for this market, use it directly and skip the general bucket model.
+        // The specialist XGBoost (AUC ~0.99) is far stronger than the bucket model for
+        // the specific market types it covers (Philadelphia high-temp).
+        if let Some(prob) = feature.specialist_prob_yes {
+            return ForecastOutput {
+                ticker: feature.ticker.clone(),
+                fair_prob_yes: prob,
+                uncertainty: 0.12,
+                confidence: 0.88,
+                model_version: format!("{}_specialist", self.artifact.model_version),
+                feature_ts: feature.feature_ts,
+            };
         }
-        self.predict_bucket(feature)
-    }
 
-    fn predict_bucket(&self, feature: &ForecastFeatureRow) -> ForecastOutput {
         let global_mean = self.artifact.global.posterior_mean(0.5, 2.0);
         let global_conf = self.artifact.global.confidence(2.0);
 
@@ -316,26 +295,6 @@ impl ForecastModel {
             .clamp(0.001, 0.999)
     }
 
-    fn predict_gbt(&self, feature: &ForecastFeatureRow, gbt: &XgboostGbtData) -> ForecastOutput {
-        let features = encode_features_for_gbt(feature, gbt);
-        let mut margin = gbt.base_score;
-        for tree in &gbt.trees {
-            margin += walk_tree(tree, &features) as f64;
-        }
-        let fair_prob_yes = sigmoid(margin).clamp(0.001, 0.999);
-        // GBT already uses mid_prob_yes as a feature, so its output is market-aware.
-        // We do not apply additional market anchoring on top.
-        ForecastOutput {
-            ticker: feature.ticker.clone(),
-            fair_prob_yes,
-            // GBT doesn't produce calibrated uncertainty natively; use conservative fixed values.
-            uncertainty: 0.10,
-            confidence: 0.90,
-            model_version: self.artifact.model_version.clone(),
-            feature_ts: feature.feature_ts,
-        }
-    }
-
     fn lookup_bucket<'a>(
         &self,
         buckets: &'a HashMap<String, RateBucket>,
@@ -378,73 +337,6 @@ impl ForecastModel {
         }
         total
     }
-}
-
-// ---------------------------------------------------------------------------
-// GBT inference helpers
-// ---------------------------------------------------------------------------
-
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// Walk one flattened XGBoost tree and return the leaf value.
-/// `nodes` must be sorted by nodeid (as produced by `flatten_tree` in the Python script).
-fn walk_tree(nodes: &[GbtNode], features: &[f32]) -> f32 {
-    let mut idx = 0usize;
-    loop {
-        let node = &nodes[idx];
-        if node.is_leaf {
-            return node.leaf_value;
-        }
-        let fv = features.get(node.feature_idx).copied().unwrap_or(f32::NAN);
-        idx = if fv.is_nan() {
-            node.missing
-        } else if fv < node.split_condition {
-            node.yes
-        } else {
-            node.no
-        };
-    }
-}
-
-/// Build the flat feature vector expected by the GBT trees.
-/// Numeric features are cast directly; categoricals are label-encoded via category_maps.
-/// Missing / unknown values become f32::NAN (XGBoost routes NaN to the `missing` child).
-fn encode_features_for_gbt(feature: &ForecastFeatureRow, gbt: &XgboostGbtData) -> Vec<f32> {
-    gbt.feature_names
-        .iter()
-        .map(|name| match name.as_str() {
-            "mid_prob_yes"             => feature.mid_prob_yes.map(|v| v as f32).unwrap_or(f32::NAN),
-            "spread_cents"             => feature.spread_cents.map(|v| v as f32).unwrap_or(f32::NAN),
-            "time_to_close_secs"       => feature.time_to_close_secs.map(|v| v as f32).unwrap_or(f32::NAN),
-            "threshold_value"          => feature.threshold_value.map(|v| v as f32).unwrap_or(f32::NAN),
-            "finance_price_signal"     => feature.finance_price_signal.map(|v| v as f32).unwrap_or(f32::NAN),
-            "weather_signal"           => feature.weather_signal.map(|v| v as f32).unwrap_or(f32::NAN),
-            "crypto_sentiment_signal"  => feature.crypto_sentiment_signal.map(|v| v as f32).unwrap_or(f32::NAN),
-            "sports_injury_signal"     => feature.sports_injury_signal.map(|v| v as f32).unwrap_or(f32::NAN),
-            "recent_trade_count_delta" => feature.recent_trade_count_delta.map(|v| v as f32).unwrap_or(f32::NAN),
-            "book_pressure"            => feature.book_pressure.map(|v| v as f32).unwrap_or(f32::NAN),
-            "vertical"                 => cat_encode(gbt, "vertical", &feature.vertical),
-            "threshold_direction"      => cat_encode_opt(gbt, "threshold_direction", feature.threshold_direction.as_deref()),
-            "market_type"              => cat_encode_opt(gbt, "market_type", feature.market_type.as_deref()),
-            _                          => f32::NAN,
-        })
-        .collect()
-}
-
-fn cat_encode(gbt: &XgboostGbtData, feat: &str, val: &str) -> f32 {
-    gbt.category_maps
-        .get(feat)
-        .and_then(|m| m.get(val))
-        .map(|&i| i as f32)
-        .unwrap_or(f32::NAN)
-}
-
-fn cat_encode_opt(gbt: &XgboostGbtData, feat: &str, val: Option<&str>) -> f32 {
-    val.and_then(|v| gbt.category_maps.get(feat)?.get(v))
-        .map(|&i| i as f32)
-        .unwrap_or(f32::NAN)
 }
 
 pub async fn run_forecast_training(cfg: &ForecastTrainingConfig) -> Result<(), ExecutionError> {
@@ -663,7 +555,6 @@ fn train_artifact(
         vertical_direction,
         vertical_entity,
         vertical_threshold,
-        gbt: None,
     }
 }
 
@@ -809,12 +700,8 @@ mod tests {
                 time_to_close_secs: Some(3600),
                 yes_bid_cents: Some(0.40),
                 yes_ask_cents: Some(0.60),
-                yes_bid_size: None,
-                yes_ask_size: None,
                 mid_prob_yes: Some(0.50),
                 spread_cents: Some(0.20),
-                book_pressure: None,
-                finance_price_signal: None,
                 volume: 100.0,
                 vertical: vertical.to_string(),
                 weather_signal: None,
@@ -999,112 +886,6 @@ mod tests {
         let w = decay_weight(future, now);
         // num_seconds().max(0) clamps negative elapsed to 0 → exp(0) = 1.0
         assert!((w - 1.0).abs() < 1e-9, "future timestamp should give weight 1.0, got {w}");
-    }
-
-    #[test]
-    fn gbt_path_dispatches_correctly() {
-        // One-split tree: feature_idx=0 (mid_prob_yes), threshold=0.5
-        // yes (< 0.5) → leaf -0.5, no (>= 0.5) → leaf +0.5
-        // base_score = 0.0 → predictions: sigmoid(-0.5) ≈ 0.378, sigmoid(+0.5) ≈ 0.622
-        let tree = vec![
-            GbtNode { is_leaf: false, feature_idx: 0, split_condition: 0.5, yes: 1, no: 2, missing: 1, leaf_value: 0.0 },
-            GbtNode { is_leaf: true,  feature_idx: 0, split_condition: 0.0, yes: 0, no: 0, missing: 0, leaf_value: -0.5 },
-            GbtNode { is_leaf: true,  feature_idx: 0, split_condition: 0.0, yes: 0, no: 0, missing: 0, leaf_value:  0.5 },
-        ];
-        let mut cat_maps = HashMap::new();
-        cat_maps.insert("vertical".to_string(), [("weather".to_string(), 0i64)].into());
-        cat_maps.insert("threshold_direction".to_string(), HashMap::new());
-        cat_maps.insert("market_type".to_string(), HashMap::new());
-        let gbt = XgboostGbtData {
-            feature_names: vec!["mid_prob_yes".to_string(), "spread_cents".to_string(),
-                "time_to_close_secs".to_string(), "threshold_value".to_string(),
-                "finance_price_signal".to_string(), "weather_signal".to_string(),
-                "crypto_sentiment_signal".to_string(), "sports_injury_signal".to_string(),
-                "recent_trade_count_delta".to_string(), "book_pressure".to_string(),
-                "vertical".to_string(), "threshold_direction".to_string(), "market_type".to_string()],
-            category_maps: cat_maps,
-            base_score: 0.0,
-            trees: vec![tree],
-        };
-        let artifact = ForecastModelArtifact {
-            schema_version: "v1".to_string(),
-            model_kind: "xgboost_gbt".to_string(),
-            model_version: "xgb-test".to_string(),
-            trained_at: Utc::now(),
-            train_rows: 1000,
-            validation_rows: 100,
-            test_rows: 100,
-            feature_schema_version: "v1".to_string(),
-            metrics: ForecastModelMetrics::default(),
-            global: RateBucket::default(),
-            vertical: HashMap::new(),
-            vertical_direction: HashMap::new(),
-            vertical_entity: HashMap::new(),
-            vertical_threshold: HashMap::new(),
-            gbt: Some(gbt),
-        };
-        let model = ForecastModel::from_artifact(artifact, 5);
-
-        let mut low_mid = sample_row("test", "A", "weather", true).feature;
-        low_mid.mid_prob_yes = Some(0.3);  // < 0.5 → yes child → leaf -0.5
-        let out_low = model.predict(&low_mid);
-        assert!(out_low.fair_prob_yes < 0.5, "low mid should predict < 0.5, got {:.4}", out_low.fair_prob_yes);
-
-        let mut high_mid = sample_row("test", "B", "weather", true).feature;
-        high_mid.mid_prob_yes = Some(0.7);  // >= 0.5 → no child → leaf +0.5
-        let out_high = model.predict(&high_mid);
-        assert!(out_high.fair_prob_yes > 0.5, "high mid should predict > 0.5, got {:.4}", out_high.fair_prob_yes);
-
-        assert_eq!(out_low.model_version, "xgb-test");
-    }
-
-    #[test]
-    fn gbt_missing_value_routes_to_missing_child() {
-        // Tree splits on mid_prob_yes; missing → yes child (leaf -0.2)
-        let tree = vec![
-            GbtNode { is_leaf: false, feature_idx: 0, split_condition: 0.5, yes: 1, no: 2, missing: 1, leaf_value: 0.0 },
-            GbtNode { is_leaf: true,  feature_idx: 0, split_condition: 0.0, yes: 0, no: 0, missing: 0, leaf_value: -0.2 },
-            GbtNode { is_leaf: true,  feature_idx: 0, split_condition: 0.0, yes: 0, no: 0, missing: 0, leaf_value:  0.2 },
-        ];
-        let mut cat_maps = HashMap::new();
-        cat_maps.insert("vertical".to_string(), HashMap::new());
-        cat_maps.insert("threshold_direction".to_string(), HashMap::new());
-        cat_maps.insert("market_type".to_string(), HashMap::new());
-        let gbt = XgboostGbtData {
-            feature_names: vec!["mid_prob_yes".to_string(), "spread_cents".to_string(),
-                "time_to_close_secs".to_string(), "threshold_value".to_string(),
-                "finance_price_signal".to_string(), "weather_signal".to_string(),
-                "crypto_sentiment_signal".to_string(), "sports_injury_signal".to_string(),
-                "recent_trade_count_delta".to_string(), "book_pressure".to_string(),
-                "vertical".to_string(), "threshold_direction".to_string(), "market_type".to_string()],
-            category_maps: cat_maps,
-            base_score: 0.0,
-            trees: vec![tree],
-        };
-        let artifact = ForecastModelArtifact {
-            schema_version: "v1".to_string(),
-            model_kind: "xgboost_gbt".to_string(),
-            model_version: "xgb-test".to_string(),
-            trained_at: Utc::now(),
-            train_rows: 1000,
-            validation_rows: 100,
-            test_rows: 100,
-            feature_schema_version: "v1".to_string(),
-            metrics: ForecastModelMetrics::default(),
-            global: RateBucket::default(),
-            vertical: HashMap::new(),
-            vertical_direction: HashMap::new(),
-            vertical_entity: HashMap::new(),
-            vertical_threshold: HashMap::new(),
-            gbt: Some(gbt),
-        };
-        let model = ForecastModel::from_artifact(artifact, 5);
-
-        // NaN mid → missing child → leaf -0.2 → sigmoid(-0.2) ≈ 0.45
-        let mut feat = sample_row("test", "C", "weather", true).feature;
-        feat.mid_prob_yes = None;
-        let out = model.predict(&feat);
-        assert!(out.fair_prob_yes < 0.5, "NaN feature should route to missing child (leaf=-0.2), got {:.4}", out.fair_prob_yes);
     }
 
     #[test]
