@@ -29,6 +29,7 @@ cargo build --release
 ./scripts/release_check.sh
 ```
 
+
 ## Architecture
 
 ```
@@ -46,6 +47,15 @@ src/
 ├── markets/           # Market mapper, market-type helpers
 └── replay/            # Multi-day replay/backtesting
 ```
+
+### Weather Specialist Sidecar
+
+Out-of-process Python/FastAPI service (`../kalshi_stack/WeatherPredictor/`) — XGBoost model (AUC 0.9959) for `KXHIGHPHI-*` markets. Fetches NOAA data, returns calibrated probability via `GET /predict?ticker=<ticker>`.
+
+- `src/data/market_enrichment.rs` calls the sidecar for Philadelphia weather tickers and populates `ForecastFeatureRow.specialist_prob_yes`
+- `src/models/forecast.rs` uses `specialist_prob_yes` as a **direct override** of the bucket model (tagged `_specialist` in model version)
+- 3s timeout; any failure falls back to bucket model silently
+- `WEATHER_SPECIALIST_URL` (bot) and `NOAA_API_TOKEN` (sidecar) must be set to activate
 
 **Operating modes** (set via `BOT_POLICY_MODE` in `.env`):
 - `legacy` — only legacy path (current trusted mode)
@@ -76,7 +86,7 @@ The entire `var/` tree (`cycles/`, `logs/`, `research/`, `features/`, `models/`,
 See `docs/execution_aware_prediction_plan.md` for the full roadmap. Post shadow-mode post-mortem (2026-03-29):
 
 1. **Issue 4:** Execution model is 99.4% synthetic data (246K synthetic vs 1.4K organic rows). Accumulate more organic paper fills before relying on execution model predictions.
-2. **Issue 1 (Forecast GBT — not yet wired in):** A GBT training script exists (`scripts/train_forecast_gbt.py`) and a trained XGBoost artifact is at `var/models/forecast/xgb_v1.ubj`. However, the Rust inference layer (`src/models/forecast.rs`) still uses the empirical shrinkage bucket model — the XGBoost model has not been wired into serving. The trained model currently has a **negative Brier skill score (-2.64 val)** — worse than market mid — because early stopping triggered at round 5. Root cause: enrichment signals (`weather_signal`, `crypto_sentiment_signal`, `sports_injury_signal`) are null in most training rows, leaving the model with almost no signal beyond what mid_prob_yes already captures. Fix: ensure enrichment signals are being collected during live capture before retraining, then wire inference into Rust once skill score is positive.
+2. **Issue 1 (General Forecast GBT — not yet wired in):** `scripts/train_forecast_gbt.py` exists and `var/models/forecast/xgb_v1.ubj` is trained, but Rust still uses the bucket model for non-weather verticals. Brier skill score is -2.64 (worse than market mid) because enrichment signals are null in most training rows. Fix: collect live enrichment data, retrain, wire in once skill score is positive. Note: the **weather specialist sidecar already bypasses this path** for `KXHIGHPHI-*` markets.
 3. **Issue 2 (Execution GBT — not started):** Execution model remains a bucket lookup table (`empirical_execution_baseline`). No GBT training script exists for execution yet. Do not prioritize until Issue 1 is resolved and organic execution data is sufficient.
 
 ## Important Files
@@ -95,6 +105,9 @@ See `docs/execution_aware_prediction_plan.md` for the full roadmap. Post shadow-
 | `scripts/check_fills.py` | Paper fill win/loss rate vs resolved outcomes |
 | `scripts/train_forecast_gbt.py` | Offline XGBoost forecast training (not yet wired into Rust serving) |
 | `var/models/forecast/xgb_v1.ubj` | Trained XGBoost artifact (currently underperforms market mid — see Issue 1) |
+| `../kalshi_stack/WeatherPredictor/sidecar.py` | Weather specialist sidecar — FastAPI service exposing XGBoost via HTTP |
+| `../kalshi_stack/WeatherPredictor/src/modeling/train_weather_model.py` | Offline training for weather specialist model |
+| `src/data/market_enrichment.rs` | Calls weather sidecar; populates `specialist_prob_yes` |
 
 ## Analysis Scripts (Python)
 

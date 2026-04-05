@@ -443,6 +443,40 @@ Turn raw logs into reproducible training tables.
 - One command can build forecast and execution datasets from research logs.
 - Splits are reproducible and leakage-checked.
 
+## Vertical Specialist Model Strategy
+
+Rather than a single general forecast GBT (Issue 1), the preferred architecture is **per-vertical out-of-process specialist sidecars** — each an independently trained XGBoost model served via FastAPI, called by the enrichment layer and overriding the bucket model via `specialist_prob_yes`. The weather sidecar proves the pattern works (AUC 0.9959).
+
+### Roadmap
+
+**Priority 1 — Crypto (next to build)**
+- Targets: `KXBTCD-*`, `KXETHD-*` and similar threshold-crossing markets
+- Data: Binance/Coinbase REST API (free, no auth required)
+- Key features: current price vs. threshold distance, rolling realized vol (1h/4h/24h), momentum, funding rate, open interest delta, time to close
+- Architecture: identical to WeatherPredictor; swap NOAA downloader for exchange price fetcher
+
+**Priority 2 — Economic indicators**
+- Start with Fed rate markets only (cleanest, thickest)
+- Data: CME FedWatch (implied rates), FRED API (prior prints)
+- Signal: consensus drift from last print + futures curve vs. market mid
+- Harder to beat an efficient market here without a proprietary data edge
+
+**Priority 3 — Sports**
+- NFL/NBA game outcome markets
+- Blocked until a reliable, timely injury feed is identified — without it the model just replicates market mid
+- Do not prioritize until data sourcing is solved
+
+### General Forecast GBT (Issue 1) — deprioritized
+The general XGBoost in `var/models/forecast/xgb_v1.ubj` remains a fallback for verticals not yet covered by a specialist. Do not invest in it until specialists cover the main volume verticals (crypto, weather). At that point the general model's role shrinks to thin/miscellaneous markets.
+
+---
+
+### Completed: Weather Vertical Specialist (2026-04-04)
+
+The Philadelphia high-temperature vertical (`KXHIGHPHI-*`) is fully served by the **weather specialist sidecar** (`../kalshi_stack/WeatherPredictor/`) — an out-of-process XGBoost model (AUC 0.9959) that bypasses the general bucket model and the general GBT (Issue 1). This is the first realized instance of the per-vertical specialist model pattern described in Phase 5. Sports, crypto, and global fallback verticals still use the bucket model.
+
+---
+
 ### Phase 5: Event Forecast Model
 
 #### Objective
@@ -485,6 +519,36 @@ Default:
 
 - Forecast model beats market-mid baseline on at least one vertical and is not materially worse on the others.
 - Model artifact can be loaded in Rust inference wrapper.
+
+### Execution Model — Training Data Design
+
+#### How synthetic labels work
+
+`scripts/retroactive_execution_labels.py` takes collected market state snapshots and simulates IOC orders at 8 price offsets around the ask (`[-10, -5, -2, -1, 0, +2, +5, +10]` cents). The fill label is **mechanically deterministic**: `limit >= ask` → filled at ask. This is exact IOC semantics on Kalshi — no approximation. Filled rows get markout computed from subsequent snapshots (mid at T+5m, T+30m).
+
+This makes the execution model fundamentally more tractable than the forecast GBT: microstructure behavior (fill probability, markout) is largely vertical-agnostic, so cross-vertical training is correct and synthetic labels are structurally sound.
+
+#### Known gaps in current synthetic data
+
+- `raw_edge_pct` and `confidence` are hardcoded to `0.0` in all retroactive rows — the model can't learn "is this edge worth taking," only "will it fill." Fix: repopulate from forecast signal at snapshot time during dataset rebuild.
+- No GTC representation — every synthetic row is IOC YES-buy. Resting order fill probability requires queue depth and order refresh features.
+- `yes_bid_size` / `yes_ask_size` not populated in retroactive rows — model can't learn book depth effects on fill.
+- Markout via mid is noisy in thin markets; underestimates adverse selection where bid/ask gaps.
+
+#### External data sources (priority order)
+
+1. **Kalshi public trade history** — `/trades` endpoint returns real public fills per market. Walk historical markets, pair with collected market state snapshots to get real fill events with surrounding features. Straightforward API work.
+2. **Polymarket historical data** — binary outcome markets on Polygon blockchain, fully public. Similar 0–100¢ pricing and spread dynamics. Thousands of resolved markets with real fill data. Microstructure features transfer almost directly. Highest volume of real execution data available.
+3. **Own paper fills** — highest quality (real `raw_edge_pct`, real `confidence`), currently ~1.4K organic rows vs 246K synthetic. Grows with time; accelerate by running paper mode on more markets.
+
+#### Priority path
+
+1. Fix `raw_edge_pct`/`confidence` in retroactive generation
+2. Add Kalshi public trade history scraping
+3. Build Polymarket data importer
+4. GTC modeling — only after IOC model is validated (more complex queue mechanics)
+
+---
 
 ### Phase 6: Execution Model
 
