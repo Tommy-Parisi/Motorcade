@@ -26,10 +26,8 @@ pub struct PolicyConfig {
     pub active_min_forecast_train_rows: usize,
     pub active_min_execution_train_rows: usize,
     pub active_min_execution_live_real_rows: usize,
-    pub active_require_live_real: bool,
-    pub active_min_shadow_decisions: usize,
-    pub active_shadow_lookback_days: i64,
-    pub active_min_shadow_mean_erpnl: f64,
+    pub active_live_real_dataset_path: PathBuf,
+    pub active_min_live_mean_markout_bps: f64,
 }
 
 impl PolicyConfig {
@@ -82,27 +80,16 @@ impl PolicyConfig {
             active_min_execution_live_real_rows: std::env::var("BOT_POLICY_ACTIVE_MIN_EXECUTION_LIVE_REAL_ROWS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(25),
-            active_require_live_real: matches!(
-                std::env::var("BOT_POLICY_ACTIVE_REQUIRE_LIVE_REAL")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "1" | "true" | "yes"
-            ),
-            active_min_shadow_decisions: std::env::var("BOT_POLICY_ACTIVE_MIN_SHADOW_DECISIONS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(50),
-            active_shadow_lookback_days: std::env::var("BOT_POLICY_ACTIVE_SHADOW_LOOKBACK_DAYS")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(7)
-                .max(1),
-            active_min_shadow_mean_erpnl: std::env::var("BOT_POLICY_ACTIVE_MIN_SHADOW_MEAN_ERPNL")
+            active_live_real_dataset_path: PathBuf::from(
+                std::env::var("BOT_EXECUTION_LIVE_REAL_PATH").unwrap_or_else(|_| {
+                    "var/features/execution/execution_training_live_real.jsonl".to_string()
+                }),
+            ),
+            active_min_live_mean_markout_bps: std::env::var("BOT_POLICY_ACTIVE_MIN_LIVE_MEAN_MARKOUT_BPS")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(-200.0),
+                .unwrap_or(0.0),
         }
     }
 }
@@ -401,11 +388,9 @@ mod tests {
             active_max_model_age_hours: 24 * 14,
             active_min_forecast_train_rows: 1_000,
             active_min_execution_train_rows: 100,
-            active_min_execution_live_real_rows: 25,
-            active_require_live_real: true,
-            active_min_shadow_decisions: 50,
-            active_shadow_lookback_days: 7,
-            active_min_shadow_mean_erpnl: -200.0,
+            active_min_execution_live_real_rows: 50,
+            active_live_real_dataset_path: PathBuf::from("var/features/execution/execution_training_live_real.jsonl"),
+            active_min_live_mean_markout_bps: 0.0,
         };
         let candidate = CandidateTrade {
             ticker: "KXTEST".to_string(),
@@ -458,11 +443,9 @@ mod tests {
             active_max_model_age_hours: 24 * 14,
             active_min_forecast_train_rows: 1_000,
             active_min_execution_train_rows: 100,
-            active_min_execution_live_real_rows: 25,
-            active_require_live_real: true,
-            active_min_shadow_decisions: 50,
-            active_shadow_lookback_days: 7,
-            active_min_shadow_mean_erpnl: -200.0,
+            active_min_execution_live_real_rows: 50,
+            active_live_real_dataset_path: PathBuf::from("var/features/execution/execution_training_live_real.jsonl"),
+            active_min_live_mean_markout_bps: 0.0,
         }
     }
 

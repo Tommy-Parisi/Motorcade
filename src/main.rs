@@ -320,7 +320,7 @@ fn validate_active_policy_requirements(
 
     validate_forecast_artifact_for_active(policy_config, forecast_model.artifact())?;
     validate_execution_artifact_for_active(policy_config, execution_model.artifact())?;
-    validate_shadow_calibration(policy_config)?;
+    validate_live_performance(policy_config)?;
     Ok(())
 }
 
@@ -361,9 +361,7 @@ fn validate_execution_artifact_for_active(
             artifact.model_version, artifact.train_rows, policy_config.active_min_execution_train_rows
         ));
     }
-    if policy_config.active_require_live_real
-        && artifact.live_real_rows < policy_config.active_min_execution_live_real_rows
-    {
+    if artifact.live_real_rows < policy_config.active_min_execution_live_real_rows {
         return Err(format!(
             "execution model {} lacks enough live-real rows for active mode (live_real_rows={} < min={})",
             artifact.model_version,
@@ -374,90 +372,51 @@ fn validate_execution_artifact_for_active(
     Ok(())
 }
 
-fn validate_shadow_calibration(policy_config: &PolicyConfig) -> Result<(), String> {
-    let shadow_policy_dir = policy_config.shadow_root.join("policy");
-
-    let cutoff = (Utc::now() - chrono::Duration::days(policy_config.active_shadow_lookback_days))
-        .date_naive();
-
-    let mut total_decisions = 0usize;
-    let mut should_trade_count = 0usize;
-    let mut erpnl_sum = 0.0f64;
-
-    let entries = match std::fs::read_dir(&shadow_policy_dir) {
-        Ok(e) => e,
+fn validate_live_performance(policy_config: &PolicyConfig) -> Result<(), String> {
+    let path = &policy_config.active_live_real_dataset_path;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
-                "shadow policy directory not found: {}; run in shadow mode first",
-                shadow_policy_dir.display()
+                "live-real execution dataset not found at {}; run trade.sh to accumulate live trades",
+                path.display()
             ));
         }
-        Err(e) => return Err(format!("cannot read shadow dir: {e}")),
+        Err(e) => return Err(format!("cannot read live-real dataset: {e}")),
     };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => return Err(format!("shadow dir entry error: {e}")),
-        };
-        let path = entry.path();
-        if !path.is_dir() {
+
+    let mut markout_sum = 0.0f64;
+    let mut markout_count = 0usize;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
             continue;
         }
-        let Some(day_str) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
         };
-        let Ok(day) = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d") else {
-            continue;
-        };
-        if day < cutoff {
-            continue;
-        }
-        let file_path = path.join("policy_shadow.jsonl");
-        let text = match std::fs::read_to_string(&file_path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("cannot read shadow file: {e}")),
-        };
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            total_decisions += 1;
-            let should_trade = v.get("should_trade").and_then(|x| x.as_bool()).unwrap_or(false);
-            if should_trade {
-                let erpnl = v
-                    .get("expected_realized_pnl")
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0);
-                should_trade_count += 1;
-                erpnl_sum += erpnl;
-            }
+        if let Some(m) = v.get("markout_5m_bps").and_then(|x| x.as_f64()) {
+            markout_sum += m;
+            markout_count += 1;
         }
     }
 
-    if total_decisions < policy_config.active_min_shadow_decisions {
+    if markout_count < policy_config.active_min_execution_live_real_rows {
         return Err(format!(
-            "active mode requires at least {} shadow decisions in the last {} days (found {}); \
-             run in shadow mode first",
-            policy_config.active_min_shadow_decisions,
-            policy_config.active_shadow_lookback_days,
-            total_decisions,
+            "active mode requires at least {} live-real rows with markout data (found {}); \
+             run trade.sh to accumulate live trades",
+            policy_config.active_min_execution_live_real_rows, markout_count,
         ));
     }
 
-    if should_trade_count > 0 {
-        let mean_erpnl = erpnl_sum / should_trade_count as f64;
-        if mean_erpnl < policy_config.active_min_shadow_mean_erpnl {
-            return Err(format!(
-                "shadow mean expected_realized_pnl ({:.2}) is below threshold ({:.2}); \
-                 recalibrate before enabling active mode",
-                mean_erpnl, policy_config.active_min_shadow_mean_erpnl,
-            ));
-        }
+    let mean_markout = markout_sum / markout_count as f64;
+    if mean_markout < policy_config.active_min_live_mean_markout_bps {
+        return Err(format!(
+            "live-real mean markout_5m_bps ({:.1}) is below threshold ({:.1}); \
+             legacy path must show positive EV on live trades before enabling active mode",
+            mean_markout, policy_config.active_min_live_mean_markout_bps,
+        ));
     }
 
     Ok(())
@@ -1799,8 +1758,7 @@ fn reentry_cooldown_secs_from_env() -> u64 {
     std::env::var("BOT_REENTRY_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(3600)
-        .max(0)
+        .unwrap_or(0)
 }
 
 fn invalid_param_cooldown_secs_from_env() -> i64 {
@@ -1995,9 +1953,6 @@ fn load_ticker_risk_state_from_journal() -> std::collections::HashMap<String, Ti
         let Some(intent) = intents.get(&payload.report.client_order_id) else {
             continue;
         };
-        if !intent.is_live() {
-            continue;
-        }
         let row = state.entry(intent.order.market_id.clone()).or_default();
         let key = order_key(&intent.order.outcome_id, intent.order.side);
         match payload.report.status {
@@ -2387,7 +2342,20 @@ mod tests {
         assert!(execution_model_path.parent().unwrap().exists());
     }
 
-    fn active_policy_config() -> PolicyConfig {
+    fn write_live_real_records(path: &std::path::Path, markouts: &[f64]) {
+        use std::io::Write;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for m in markouts {
+            writeln!(f, r#"{{"markout_5m_bps":{m},"execution_source_class":"live_real"}}"#).unwrap();
+        }
+    }
+
+    fn active_policy_config_with_live_real(live_real_path: &std::path::Path) -> PolicyConfig {
         PolicyConfig {
             mode: PolicyMode::Active,
             shadow_enabled: true,
@@ -2399,65 +2367,39 @@ mod tests {
             active_max_model_age_hours: 24 * 14,
             active_min_forecast_train_rows: 1_000,
             active_min_execution_train_rows: 100,
-            active_min_execution_live_real_rows: 25,
-            active_require_live_real: true,
-            active_min_shadow_decisions: 50,
-            active_shadow_lookback_days: 7,
-            active_min_shadow_mean_erpnl: -200.0,
-        }
-    }
-
-    fn make_policy_config_for_shadow_test(shadow_root: &std::path::Path) -> PolicyConfig {
-        PolicyConfig {
-            shadow_root: shadow_root.to_path_buf(),
-            active_require_live_real: false,
-            active_min_shadow_decisions: 2,
-            active_shadow_lookback_days: 30,
-            ..active_policy_config()
-        }
-    }
-
-    fn write_shadow_records(dir: &std::path::Path, records: &[(&str, bool, f64)]) {
-        use std::io::Write;
-        let day_dir = dir.join("policy").join("2026-03-30");
-        fs::create_dir_all(&day_dir).unwrap();
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(day_dir.join("policy_shadow.jsonl"))
-            .unwrap();
-        for (cycle_id, should_trade, erpnl) in records {
-            let line = format!(
-                r#"{{"cycle_id":"{cycle_id}","recorded_at":"2026-03-30T00:00:00Z","ticker":"KXNBA-X","outcome_id":"yes","legacy_edge_pct":0.1,"legacy_confidence":0.9,"chosen_tif":"Gtc","chosen_limit_price":0.5,"should_trade":{should_trade},"size_multiplier":1.0,"expected_fill_prob":0.5,"expected_gross_edge":0.1,"expected_realized_pnl":{erpnl},"rejection_reason":null,"rationale":"test"}}"#
-            );
-            writeln!(f, "{line}").unwrap();
+            active_min_execution_live_real_rows: 3,
+            active_live_real_dataset_path: live_real_path.to_path_buf(),
+            active_min_live_mean_markout_bps: 0.0,
         }
     }
 
     #[test]
-    fn shadow_gate_passes_with_sufficient_data() {
+    fn live_performance_gate_passes_positive_markout() {
         let dir = tempdir().unwrap();
-        write_shadow_records(dir.path(), &[("c1", true, 5.0), ("c2", true, 3.0), ("c3", false, 0.0)]);
-        let cfg = make_policy_config_for_shadow_test(dir.path());
-        assert!(validate_shadow_calibration(&cfg).is_ok());
+        let p = dir.path().join("live_real.jsonl");
+        write_live_real_records(&p, &[50.0, 100.0, 75.0]);
+        let cfg = active_policy_config_with_live_real(&p);
+        assert!(validate_live_performance(&cfg).is_ok());
     }
 
     #[test]
-    fn shadow_gate_fails_too_few_decisions() {
+    fn live_performance_gate_fails_too_few_rows() {
         let dir = tempdir().unwrap();
-        write_shadow_records(dir.path(), &[("c1", true, 5.0)]);
-        let mut cfg = make_policy_config_for_shadow_test(dir.path());
-        cfg.active_min_shadow_decisions = 5;
-        let err = validate_shadow_calibration(&cfg).unwrap_err();
-        assert!(err.contains("shadow decisions"), "{err}");
+        let p = dir.path().join("live_real.jsonl");
+        write_live_real_records(&p, &[50.0, 100.0]);
+        let cfg = active_policy_config_with_live_real(&p);
+        let err = validate_live_performance(&cfg).unwrap_err();
+        assert!(err.contains("live-real rows"), "{err}");
     }
 
     #[test]
-    fn shadow_gate_fails_low_mean_erpnl() {
+    fn live_performance_gate_fails_negative_markout() {
         let dir = tempdir().unwrap();
-        write_shadow_records(dir.path(), &[("c1", true, -500.0), ("c2", true, -600.0), ("c3", true, -400.0)]);
-        let cfg = make_policy_config_for_shadow_test(dir.path());
-        let err = validate_shadow_calibration(&cfg).unwrap_err();
+        let p = dir.path().join("live_real.jsonl");
+        write_live_real_records(&p, &[-200.0, -300.0, -150.0]);
+        let mut cfg = active_policy_config_with_live_real(&p);
+        cfg.active_min_live_mean_markout_bps = 0.0;
+        let err = validate_live_performance(&cfg).unwrap_err();
         assert!(err.contains("below threshold"), "{err}");
     }
 
@@ -2510,21 +2452,13 @@ mod tests {
         )
     }
 
-    fn active_policy_config_with_shadow(shadow_root: &std::path::Path) -> PolicyConfig {
-        PolicyConfig {
-            shadow_root: shadow_root.to_path_buf(),
-            active_require_live_real: true,
-            active_min_shadow_decisions: 0,
-            ..active_policy_config()
-        }
-    }
-
     #[test]
     fn active_policy_validation_rejects_insufficient_live_real_rows() {
         let dir = tempdir().unwrap();
-        // Create empty policy dir so shadow gate passes (min decisions = 0)
-        fs::create_dir_all(dir.path().join("policy")).unwrap();
-        let cfg = active_policy_config_with_shadow(dir.path());
+        let p = dir.path().join("live_real.jsonl");
+        // Write fewer rows than the minimum
+        write_live_real_records(&p, &[50.0]);
+        let cfg = active_policy_config_with_live_real(&p);
         let forecast = good_forecast_model();
         let execution = execution_model_with_live_rows(0);
 
@@ -2536,8 +2470,9 @@ mod tests {
     #[test]
     fn active_policy_validation_accepts_sufficient_models() {
         let dir = tempdir().unwrap();
-        write_shadow_records(dir.path(), &[("c1", true, 5.0), ("c2", true, 3.0)]);
-        let cfg = active_policy_config_with_shadow(dir.path());
+        let p = dir.path().join("live_real.jsonl");
+        write_live_real_records(&p, &[50.0, 100.0, 75.0]);
+        let cfg = active_policy_config_with_live_real(&p);
         let forecast = good_forecast_model();
         let execution = execution_model_with_live_rows(50);
 

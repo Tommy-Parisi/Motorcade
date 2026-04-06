@@ -133,18 +133,12 @@ impl MarketEnricher {
         match vertical {
             MarketVertical::Weather => {
                 weather_signal = self.fetch_noaa_weather_signal(&market.ticker).await?;
-                // For Philadelphia high-temp markets, call the specialist sidecar when configured.
+                // For all KXHIGH* markets, call the specialist sidecar when configured.
                 // Falls back silently so a down sidecar never blocks a trading cycle.
-                if self.cfg.weather_specialist_url.is_some() {
-                    let city = extract_city_from_ticker(&market.ticker)
-                        .map(|s| s.to_ascii_uppercase());
-                    let is_philly = matches!(
-                        city.as_deref(),
-                        Some("PHI") | Some("PHIL") | Some("PHILLY") | Some("PHL")
-                    );
-                    if is_philly {
-                        specialist_prob_yes = self.fetch_specialist_prob(&market.ticker).await;
-                    }
+                if self.cfg.weather_specialist_url.is_some()
+                    && market.ticker.to_ascii_uppercase().starts_with("KXHIGH")
+                {
+                    specialist_prob_yes = self.fetch_specialist_prob(&market.ticker).await;
                 }
             }
             MarketVertical::Sports => {
@@ -620,6 +614,20 @@ fn city_coords(city_code: &str) -> Option<&'static str> {
         "NYC" | "NY"  => Some("40.7128,-74.0060"),  // New York City
         "ORL" => Some("28.5383,-81.3792"),   // Orlando
         "PHI" | "PHIL" | "PHILLY" | "PHL" => Some("39.9526,-75.1652"),   // Philadelphia
+        // New-format KXHIGHT{CITY} codes (T prefix comes from "KXHIGH" + "T..." city segment)
+        "TATL"  => Some("33.6407,-84.4277"),   // Atlanta (ATL airport)
+        "TBOS"  => Some("42.3601,-71.0060"),   // Boston (BOS airport)
+        "TDC"   => Some("38.8512,-77.0402"),   // Washington DC (DCA)
+        "TDAL"  => Some("32.8998,-97.0403"),   // Dallas (DFW airport)
+        "THOU"  => Some("29.9902,-95.3368"),   // Houston (IAH airport)
+        "TLV"   => Some("36.0840,-115.1537"),  // Las Vegas (LAS airport)
+        "TMIN"  => Some("44.8848,-93.2223"),   // Minneapolis (MSP airport)
+        "TNOLA" => Some("29.9934,-90.2580"),   // New Orleans (MSY airport)
+        "TOKC"  => Some("35.3931,-97.6007"),   // Oklahoma City (OKC airport)
+        "TPHX"  => Some("33.4373,-112.0078"),  // Phoenix (PHX airport)
+        "TSATX" => Some("29.5337,-98.4698"),   // San Antonio (SAT airport)
+        "TSEA"  => Some("47.4502,-122.3088"),  // Seattle (SEA airport)
+        "TSFO"  => Some("37.6213,-122.3790"),  // San Francisco (SFO airport)
         "PHX" => Some("33.4484,-112.0740"),  // Phoenix
         "PIT" => Some("40.4406,-79.9959"),   // Pittsburgh
         "PDX" => Some("45.5051,-122.6750"),  // Portland

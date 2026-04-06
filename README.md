@@ -97,17 +97,14 @@ Implemented, but recommended in `shadow` mode for now.
 
 ## Recommended Reality Check
 
-The important practical distinction in this repo is:
+- The legacy trading loop is operational and is what executes trades in both `shadow` and `live` mode.
+- The forecast model is promising but underperforms market mid on crypto (~96% of volume) because no CryptoPredictor sidecar exists yet.
+- The execution model's `fill_30s`/`fill_5m` labels are meaningless on paper data — the paper path always fills. Organic paper rows help `markout` and `fill_price` calibration only. Fill probability requires live-real data.
+- `BOT_POLICY_MODE=active` is gated on actual live trade performance (markout), not estimated ERPNL from the execution model.
 
-- the legacy trading loop is operational
-- the forecast model is promising
-- the execution model is still provisional
-- policy-driven execution should stay in `shadow` until there is more clean execution data
+**Before going live:** run `python3 scripts/simulate_pnl.py` and confirm positive simulated ROI. Win rate alone is misleading — buying high-probability contracts at 70% win rate still loses money because losses are larger than wins. The simulation applies the $500/ticker notional cap and computes actual dollar PnL.
 
-That means:
-
-- `BOT_POLICY_MODE=shadow` is the recommended default for the new stack
-- `BOT_POLICY_MODE=active` exists, but should be used cautiously and only after manual review and more trustworthy execution data
+**Before enabling active mode:** the code-enforced gate requires 50+ live-real execution rows with mean `markout_5m_bps` ≥ 0.
 
 ## Architecture
 
@@ -314,11 +311,11 @@ Execution rows are classified into:
 - `organic_paper`
 - `live_real`
 
-This matters because not all execution data is equally useful.
+Not all execution data is equally useful:
 
-- bootstrap rows are useful for plumbing validation
-- organic paper rows are useful for early execution research
-- live real rows are the highest-value long-term execution labels
+- `bootstrap_synthetic` — useful only for plumbing validation
+- `organic_paper` — helps `markout` and `fill_price` calibration; fill probability labels (`fill_30s`/`fill_5m`) are always 1.0 because the paper path always fills (`limit >= ask` is true for all candidates)
+- `live_real` — the only source with real fill variance; required for fill probability and the active-mode gate
 
 Execution training defaults to:
 
@@ -449,17 +446,14 @@ Artifacts are written to:
 
 Important caveat:
 
-The execution model is still small-sample and should be treated as provisional. It is useful for shadow analysis and research iteration, not as an unquestioned live control surface.
+The execution model's fill probability outputs are meaningless until live-real data accumulates. Organic paper data helps markout and fill-price calibration only. Treat the model as provisional until 50+ live-real rows exist.
 
 ### Data governance rules
 
-- Keep execution provenance separated:
-  - `bootstrap_synthetic`
-  - `organic_paper`
-  - `live_real`
-- Do not use `bootstrap_synthetic` as a default training source for execution models intended to inform rollout decisions.
+- Keep execution provenance separated: `bootstrap_synthetic`, `organic_paper`, `live_real`.
+- Do not use `bootstrap_synthetic` as a default training source for execution models.
 - Treat `organic_paper + live_real` as the clean execution slice.
-- Keep `BOT_POLICY_MODE=shadow` until execution reports show enough clean rows and enough `live_real` coverage.
+- `BOT_POLICY_MODE=active` is gated on live-real markout ≥ 0 over 50+ live rows — not on paper row count or estimated ERPNL.
 
 ### Retraining rules of thumb
 
@@ -523,10 +517,11 @@ Policy mode is controlled by `BOT_POLICY_MODE`.
 ### `active`
 
 - policy decisions influence ranking, pricing, and sizing
-- fails closed at startup if policy prerequisites are not met
-- checks model age and minimum training-row thresholds
-- can require a minimum count of `live_real` execution rows
-- should only be used after manual review and stronger execution-data coverage
+- fails closed at startup if prerequisites are not met:
+  - forecast and execution models within max age
+  - execution model has ≥ `BOT_POLICY_ACTIVE_MIN_EXECUTION_LIVE_REAL_ROWS` (default 50) live-real rows
+  - mean `markout_5m_bps` across those live-real rows ≥ `BOT_POLICY_ACTIVE_MIN_LIVE_MEAN_MARKOUT_BPS` (default 0)
+- do not enable until `check_fills.py` confirms the legacy path has positive EV on live data
 
 ## Reports and Artifacts
 
@@ -630,8 +625,8 @@ This project is heavily env-driven. The most important controls are:
 - `BOT_POLICY_ACTIVE_MAX_MODEL_AGE_HOURS`
 - `BOT_POLICY_ACTIVE_MIN_FORECAST_TRAIN_ROWS`
 - `BOT_POLICY_ACTIVE_MIN_EXECUTION_TRAIN_ROWS`
-- `BOT_POLICY_ACTIVE_MIN_EXECUTION_LIVE_REAL_ROWS`
-- `BOT_POLICY_ACTIVE_REQUIRE_LIVE_REAL`
+- `BOT_POLICY_ACTIVE_MIN_EXECUTION_LIVE_REAL_ROWS` (default 50)
+- `BOT_POLICY_ACTIVE_MIN_LIVE_MEAN_MARKOUT_BPS` (default 0 — mean markout_5m_bps across live-real rows must be ≥ this)
 
 ## Common Workflows
 
@@ -647,6 +642,7 @@ set -a; source .env; set +a
 BOT_RUN_OUTCOME_BACKFILL=true cargo run --release --quiet   # pull resolutions from Kalshi
 BOT_RUN_DATASET_BUILD=true cargo run --release --quiet       # rebuild training datasets
 python3 scripts/check_fills.py                               # check paper fill win/loss rate
+python3 scripts/simulate_pnl.py                              # realistic PnL with guards applied
 python3 scripts/evaluate_shadow.py                           # forecast calibration + policy hit rate
 BOT_RUN_FORECAST_TRAIN=true cargo run --release --quiet      # retrain forecast model on new outcomes
 ```
@@ -659,53 +655,27 @@ scripts/release_check.sh
 
 ### Operational profiles
 
-The project now includes stable entrypoint scripts for the main operating modes:
+Two main scripts:
 
 ```bash
-scripts/run_live_shadow.sh
-scripts/run_research_capture.sh
-scripts/run_research_paper_capture.sh
+scripts/trade.sh    # live trading, Claude enabled, shadow policy (production)
+scripts/collect.sh  # paper trading, no Claude, data collection (runs 24/7 on server)
+```
+
+Supporting scripts:
+
+```bash
 scripts/rebuild_models.sh
 scripts/morning_review.sh
 scripts/compare_execution_slices.sh
-scripts/run_organic_paper_collection.sh
 scripts/execution_data_report.sh
 ```
 
-Each script:
-- sources `.env` if present
-- uses sensible defaults for that mode
-- still allows env-var overrides when needed
-
-Examples:
+### Run one cycle
 
 ```bash
-BOT_RUN_ONCE=true scripts/run_live_shadow.sh
-BOT_RUN_ONCE=true scripts/run_research_capture.sh
-BOT_RUN_ONCE=true scripts/run_research_paper_capture.sh
-BOT_CARGO_PROFILE=release scripts/rebuild_models.sh
-scripts/morning_review.sh
-scripts/compare_execution_slices.sh
-BOT_RUN_ONCE=true scripts/run_organic_paper_collection.sh
-scripts/execution_data_report.sh
-```
-
-### Overnight run
-
-```bash
-caffeinate -dimsu scripts/run_live_shadow.sh | tee var/logs/overnight_$(date +%Y-%m-%d).log
-```
-
-### Run one normal cycle
-
-```bash
-BOT_RUN_ONCE=true scripts/run_live_shadow.sh
-```
-
-### Run a safe live cycle with policy shadow
-
-```bash
-BOT_RUN_ONCE=true scripts/run_live_shadow.sh
+BOT_RUN_ONCE=true scripts/trade.sh
+BOT_RUN_ONCE=true scripts/collect.sh
 ```
 
 ### Run research capture only
