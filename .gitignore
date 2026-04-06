@@ -10,3 +10,5 @@ var/research/
 var/features/
 var/models/
 var/state/
+sidecars/crypto/__pycache__
+sidecars/crypto/tests/__pycache__

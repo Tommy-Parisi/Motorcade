@@ -25,6 +25,11 @@ pub struct EnrichmentConfig {
     /// When set, Philadelphia high-temp markets get a calibrated XGBoost probability
     /// instead of the raw NOAA temperature signal. Set via WEATHER_SPECIALIST_URL.
     pub weather_specialist_url: Option<String>,
+    /// Optional URL of the CryptoPredictor sidecar (e.g. http://127.0.0.1:8766).
+    /// When set, KXBTCD/KXETHD/KXSOLD/KXXRPD markets get a GBM threshold-crossing
+    /// probability instead of the sentiment + price-distance heuristic. Set via
+    /// CRYPTO_SPECIALIST_URL.
+    pub crypto_specialist_url: Option<String>,
 }
 
 impl Default for EnrichmentConfig {
@@ -39,6 +44,7 @@ impl Default for EnrichmentConfig {
                 .or_else(|| Some("https://api.alternative.me/fng/?limit=1".to_string())),
             esports_api_url: std::env::var("ESPORTS_API_URL").ok(),
             weather_specialist_url: std::env::var("WEATHER_SPECIALIST_URL").ok(),
+            crypto_specialist_url: std::env::var("CRYPTO_SPECIALIST_URL").ok(),
         }
     }
 }
@@ -183,6 +189,14 @@ impl MarketEnricher {
                         None
                     }
                 };
+                // Shadow: call crypto specialist and log prediction, but do NOT set
+                // specialist_prob_yes — bucket model remains authoritative until the
+                // sidecar accumulates enough shadow predictions to validate calibration.
+                if let Some(url) = self.cfg.crypto_specialist_url.as_deref() {
+                    if let Some(p) = self.fetch_specialist_prob_from(&market.ticker, url).await {
+                        eprintln!("crypto_specialist_shadow ticker={} prob={:.4}", market.ticker, p);
+                    }
+                }
             }
             MarketVertical::Politics | MarketVertical::Other => {}
         }
@@ -285,11 +299,15 @@ impl MarketEnricher {
         Ok(temp)
     }
 
-    /// Call the WeatherPredictor sidecar for a calibrated P(high_temp > threshold).
+    /// Call a specialist sidecar for a calibrated probability.
     /// Returns None on any error, or when the sidecar signals data_source_ok=false,
     /// so a down or stale sidecar never blocks a trading cycle.
     async fn fetch_specialist_prob(&self, ticker: &str) -> Option<f64> {
         let base_url = self.cfg.weather_specialist_url.as_deref()?;
+        self.fetch_specialist_prob_from(ticker, base_url).await
+    }
+
+    async fn fetch_specialist_prob_from(&self, ticker: &str, base_url: &str) -> Option<f64> {
         let url = format!("{}/predict?ticker={}", base_url, ticker);
         let resp = self
             .http

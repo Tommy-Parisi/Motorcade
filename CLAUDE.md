@@ -56,7 +56,8 @@ Forecast is handled by a **motorcade of out-of-process Python/FastAPI sidecars**
 **Active sidecars:**
 - `sidecars/weather/` — GEFS 31-member ensemble for all live weather cities (`KXHIGHT{BOS,DAL,HOU,SEA,PHX,SATX,LV,ATL,MIN,NOLA,DC,SFO,OKC}`). Cache keyed by `(city, date)`. Env: `WEATHER_SPECIALIST_URL` (default `http://127.0.0.1:8765`). Start: `sidecars/weather/start.sh`.
 
-**Next to build:** CryptoPredictor (`KXBTCD-*`, `KXETHD-*`) — price distance, rolling vol, momentum from exchange APIs.
+**Shadow sidecars (do not override bucket model yet):**
+- `sidecars/crypto/` — GBM threshold-crossing probability for `KXBTCD-*`, `KXETHD-*`, `KXSOLD-*`, `KXXRPD-*`. Coinbase/Binance price feed, 30s refresh. Env: `CRYPTO_SPECIALIST_URL` (default unset). Shadow only: Rust logs predictions to stderr but does not set `specialist_prob_yes`. Promote after 1-week shadow validates calibration vs bucket. Start: `sidecars/crypto/start.sh`.
 
 **Operating modes** (set via `BOT_POLICY_MODE` in `.env`):
 - `legacy` — only legacy path (current trusted mode)
