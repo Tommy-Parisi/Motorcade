@@ -881,6 +881,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: None,
             yes_ask_cents: None,
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: 0.0,
             close_time: None,
         };
@@ -893,6 +895,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: None,
             yes_ask_cents: None,
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume: 0.0,
             close_time: None,
         };
@@ -1034,6 +1038,8 @@ mod tests {
             series_ticker: None,
             yes_bid_cents: Some(45.0),
             yes_ask_cents: Some(50.0),
+            yes_bid_size: None,
+            yes_ask_size: None,
             volume,
             close_time: None,
         }

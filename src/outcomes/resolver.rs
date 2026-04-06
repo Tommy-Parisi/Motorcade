@@ -99,47 +99,45 @@ fn collect_candidate_tickers(
     let mut out = BTreeMap::new();
     let cutoff_day = Utc::now().date_naive() - Duration::days(cfg.lookback_days);
     let root = cfg.research_dir.join("market_state");
-    if !root.exists() {
-        return Ok(out);
-    }
-
-    for entry in fs::read_dir(root).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
-        let entry = entry.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(day_name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(day) = chrono::NaiveDate::parse_from_str(day_name, "%Y-%m-%d") else {
-            continue;
-        };
-        if day < cutoff_day {
-            continue;
-        }
-        for file in fs::read_dir(path).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
-            let file = file.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-            let file_path = file.path();
-            if file_path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+    if root.exists() {
+        for entry in fs::read_dir(root).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
+            let entry = entry.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+            let path = entry.path();
+            if !path.is_dir() {
                 continue;
             }
-            let text =
-                fs::read_to_string(&file_path).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
-            for line in text.lines() {
-                if line.trim().is_empty() {
+            let Some(day_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(day) = chrono::NaiveDate::parse_from_str(day_name, "%Y-%m-%d") else {
+                continue;
+            };
+            if day < cutoff_day {
+                continue;
+            }
+            for file in fs::read_dir(path).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
+                let file = file.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+                let file_path = file.path();
+                if file_path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let event: MarketStateEvent = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let should_consider = event
-                    .close_time
-                    .map(|close| close <= Utc::now())
-                    .unwrap_or(false);
-                if should_consider {
-                    out.entry(event.ticker).or_insert(event.close_time);
+                let text =
+                    fs::read_to_string(&file_path).map_err(|e| ExecutionError::Exchange(e.to_string()))?;
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: MarketStateEvent = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let should_consider = event
+                        .close_time
+                        .map(|close| close <= Utc::now())
+                        .unwrap_or(false);
+                    if should_consider {
+                        out.entry(event.ticker).or_insert(event.close_time);
+                    }
                 }
             }
         }

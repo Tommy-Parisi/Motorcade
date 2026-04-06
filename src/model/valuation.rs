@@ -810,12 +810,12 @@ fn market_mid_prob_yes(market: &ScannedMarket) -> Option<f64> {
     Some(((bid + ask) / 2.0 / 100.0).clamp(0.01, 0.99))
 }
 
-/// Converts an enrichment signal into an additive probability bias in roughly [-0.08, +0.08].
+/// Converts an enrichment signal into an additive probability bias in roughly [-0.05, +0.05].
 ///
 /// For weather: `weather_signal` is raw °F from NOAA. We normalize it relative to the
 /// market-specific threshold extracted from the ticker (e.g. "will high exceed 55°F?").
 ///   signal = (forecast_temp - threshold) / 15.0  clamped to [-1, 1]
-/// A forecast 15°F above the threshold → +1.0 → +0.08 probability bias toward YES.
+/// A forecast 15°F above the threshold → +1.0 → +0.05 probability bias toward YES.
 /// If no threshold can be extracted the weather signal contributes nothing (ambiguous direction).
 ///
 /// Sports/crypto signals are already in [-1, 1] from their respective feeds.
@@ -890,6 +890,8 @@ mod tests {
                 series_ticker: None,
                 yes_bid_cents: Some(mid_bid),
                 yes_ask_cents: Some(mid_ask),
+                yes_bid_size: None,
+                yes_ask_size: None,
                 volume: 10_000.0,
                 close_time: None,
             },
@@ -1282,32 +1284,33 @@ mod tests {
             crypto_price_signal: None,
             esports_signal: None,
             finance_price_signal: None,
+            specialist_prob_yes: None,
             generated_at: Utc::now(),
         }
     }
 
     #[test]
     fn enrichment_bias_weather_forecast_above_threshold() {
-        // ticker threshold = 55°F, forecast = 70°F → (70-55)/15 = 1.0 clamped → bias = +0.08
+        // ticker threshold = 55°F, forecast = 70°F → (70-55)/15 = 1.0 clamped → bias = +0.05
         let e = weather_enrichment(70.0);
         let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
-        assert!((bias - 0.08).abs() < 1e-9, "bias={bias}");
+        assert!((bias - 0.05).abs() < 1e-9, "bias={bias}");
     }
 
     #[test]
     fn enrichment_bias_weather_forecast_below_threshold() {
-        // forecast = 40°F, threshold = 55°F → (40-55)/15 = -1.0 clamped → bias = -0.08
+        // forecast = 40°F, threshold = 55°F → (40-55)/15 = -1.0 clamped → bias = -0.05
         let e = weather_enrichment(40.0);
         let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
-        assert!((bias - (-0.08)).abs() < 1e-9, "bias={bias}");
+        assert!((bias - (-0.05)).abs() < 1e-9, "bias={bias}");
     }
 
     #[test]
     fn enrichment_bias_weather_partial_signal() {
-        // forecast = 62°F, threshold = 55°F → (62-55)/15 = 0.4667 → bias ≈ 0.0373
+        // forecast = 62°F, threshold = 55°F → (62-55)/15 = 0.4667 → bias ≈ 0.0233
         let e = weather_enrichment(62.0);
         let bias = enrichment_bias(&e, "KXHIGHCHI-26MAR25-T55");
-        let expected = (7.0_f64 / 15.0) * 0.08;
+        let expected = (7.0_f64 / 15.0) * 0.05;
         assert!((bias - expected).abs() < 1e-9, "bias={bias} expected={expected}");
     }
 
@@ -1321,7 +1324,7 @@ mod tests {
 
     #[test]
     fn enrichment_bias_sports_injury_unchanged() {
-        // Sports signal is already in [-1, 1]; just scaled by 0.08
+        // Sports signal is already in [-1, 1]; just scaled by 0.05
         let e = crate::data::market_enrichment::MarketEnrichment {
             ticker: "KXNBA".to_string(),
             vertical: crate::data::market_enrichment::MarketVertical::Sports,
@@ -1331,9 +1334,10 @@ mod tests {
             crypto_price_signal: None,
             esports_signal: None,
             finance_price_signal: None,
+            specialist_prob_yes: None,
             generated_at: Utc::now(),
         };
         let bias = enrichment_bias(&e, "KXNBAGAME-26MAR24BOSNYC-BOS");
-        assert!((bias - 0.04).abs() < 1e-9, "bias={bias}");
+        assert!((bias - 0.025).abs() < 1e-9, "bias={bias}");
     }
 }

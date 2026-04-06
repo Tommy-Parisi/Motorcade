@@ -616,6 +616,7 @@ mod tests {
             signal_origin: Some("bootstrap_synthetic".to_string()),
             execution_mode: Some("paper".to_string()),
             status: None,
+            is_synthetic: false,
             event_type: "intent".to_string(),
             error: None,
         };
@@ -646,6 +647,7 @@ mod tests {
             signal_origin: Some("model_candidate".to_string()),
             execution_mode: Some("paper".to_string()),
             status: None,
+            is_synthetic: false,
             event_type: "intent".to_string(),
             error: None,
         };
@@ -676,6 +678,7 @@ mod tests {
             signal_origin: None,
             execution_mode: None,      // no execution_mode set
             status: None,
+            is_synthetic: false,
             event_type: "intent".to_string(),
             error: None,
         };
@@ -712,6 +715,7 @@ mod tests {
             signal_origin: Some("model_candidate".to_string()),
             execution_mode: Some("live".to_string()),
             status: Some(OrderStatus::Filled),
+            is_synthetic: false,
             event_type: "intent".to_string(),
             error: None,
         };
@@ -747,13 +751,18 @@ mod tests {
                     time_to_close_secs: None,
                     yes_bid_cents: None,
                     yes_ask_cents: None,
+                    yes_bid_size: None,
+                    yes_ask_size: None,
                     mid_prob_yes: None,
                     spread_cents: None,
+                    book_pressure: None,
                     volume: 0.0,
                     vertical: "other".to_string(),
                     weather_signal: None,
                     sports_injury_signal: None,
                     crypto_sentiment_signal: None,
+                    finance_price_signal: None,
+                    specialist_prob_yes: None,
                     entity_primary: None,
                     entity_secondary: None,
                     threshold_value: None,
@@ -793,6 +802,7 @@ mod tests {
             signal_origin: None,
             execution_mode: None,
             status: None,
+            is_synthetic: false,
             event_type: "intent".to_string(),
             error: None,
         }
