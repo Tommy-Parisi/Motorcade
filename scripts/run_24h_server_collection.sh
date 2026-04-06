@@ -34,7 +34,7 @@ find "${THEBANK_LOG_DIR}" -name "24h_collection_*.log" -mtime +7 -delete 2>/dev/
 
 # --- IMMUNITY: Override .env settings that block collection ---
 export BOT_CLAUDE_VERTICAL_BLOCKLIST="" # ALLOW Claude to value all verticals
-export BOT_CLAUDE_TRIGGER_MODE="on_heuristic_candidates"
+export BOT_CLAUDE_TRIGGER_MODE="never"
 export BOT_VALUATION_CACHE_TTL_SECS="60"
 
 # --- PERIODIC BACKGROUND TASKS ---
