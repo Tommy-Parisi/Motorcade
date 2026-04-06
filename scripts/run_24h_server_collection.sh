@@ -45,6 +45,7 @@ export BOT_OUTCOME_LOOKBACK_DAYS="14"
 
 # --- Execution & Capture Configuration ---
 export BOT_EXECUTION_MODE="paper"
+export BOT_MAX_OPEN_EXPOSURE="100000000"  # No kill switch in paper mode — fake money
 export BOT_RUN_RESEARCH_PAPER_CAPTURE_ONLY="true"
 export BOT_CARGO_PROFILE="release"
 export BOT_CYCLE_SECONDS="600" 
