@@ -12,3 +12,4 @@ var/models/
 var/state/
 sidecars/crypto/__pycache__
 sidecars/crypto/tests/__pycache__
+sidecars/hawkwatchers/
