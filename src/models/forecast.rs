@@ -199,17 +199,30 @@ impl ForecastModel {
     }
 
     pub fn predict(&self, feature: &ForecastFeatureRow) -> ForecastOutput {
-        // Specialist override: when the WeatherPredictor sidecar produced a calibrated
-        // probability for this market, use it directly and skip the general bucket model.
-        // The specialist XGBoost (AUC ~0.99) is far stronger than the bucket model for
-        // the specific market types it covers (Philadelphia high-temp).
-        if let Some(prob) = feature.specialist_prob_yes {
+        // Specialist override: when a specialist sidecar produced a calibrated probability
+        // for this market, use it directly and skip the general bucket model.
+        // weather specialist (XGBoost, AUC ~0.99) covers Philadelphia high-temp markets.
+        // Fed specialist (TF-IDF+MLP) covers Fed/FOMC rate-decision markets.
+        // Crypto specialist covers BTC/ETH/etc. price-threshold markets (when configured).
+        let specialist = feature.specialist_prob_yes
+            .or(feature.fed_specialist_prob_yes)
+            .or(feature.crypto_specialist_prob_yes);
+        let specialist_tag = if feature.specialist_prob_yes.is_some() {
+            "weather_specialist"
+        } else if feature.fed_specialist_prob_yes.is_some() {
+            "fed_specialist"
+        } else if feature.crypto_specialist_prob_yes.is_some() {
+            "crypto_specialist"
+        } else {
+            "specialist"
+        };
+        if let Some(prob) = specialist {
             return ForecastOutput {
                 ticker: feature.ticker.clone(),
                 fair_prob_yes: prob,
                 uncertainty: 0.12,
                 confidence: 0.88,
-                model_version: format!("{}_specialist", self.artifact.model_version),
+                model_version: format!("{}_{}", self.artifact.model_version, specialist_tag),
                 feature_ts: feature.feature_ts,
             };
         }

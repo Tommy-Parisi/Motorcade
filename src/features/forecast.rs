@@ -45,6 +45,12 @@ pub struct ForecastFeatureRow {
     /// Calibrated probability from the WeatherPredictor specialist sidecar.
     /// Present only for supported cities (Philadelphia) when sidecar is running.
     pub specialist_prob_yes: Option<f64>,
+    /// Calibrated probability from the FedWatcher specialist sidecar.
+    /// Present only for Fed/FOMC rate tickers when FED_SPECIALIST_URL is configured.
+    pub fed_specialist_prob_yes: Option<f64>,
+    /// Calibrated probability from the Crypto specialist sidecar.
+    /// Present only when CRYPTO_SPECIALIST_URL is configured.
+    pub crypto_specialist_prob_yes: Option<f64>,
     pub entity_primary: Option<String>,
     pub entity_secondary: Option<String>,
     pub threshold_value: Option<f64>,
@@ -91,6 +97,8 @@ pub fn build_forecast_feature_row(
         crypto_sentiment_signal: enrichment.and_then(|e| e.crypto_sentiment_signal),
         finance_price_signal: enrichment.and_then(|e| e.finance_price_signal),
         specialist_prob_yes: enrichment.and_then(|e| e.specialist_prob_yes),
+        fed_specialist_prob_yes: enrichment.and_then(|e| e.fed_specialist_prob_yes),
+        crypto_specialist_prob_yes: enrichment.and_then(|e| e.crypto_specialist_prob_yes),
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,
@@ -134,6 +142,8 @@ pub fn build_forecast_feature_row_from_event(event: &MarketStateEvent) -> Foreca
         crypto_sentiment_signal: None,
         finance_price_signal: event.finance_price_signal,
         specialist_prob_yes: None,
+        fed_specialist_prob_yes: None,
+        crypto_specialist_prob_yes: None,
         entity_primary: parsed.entity_primary,
         entity_secondary: parsed.entity_secondary,
         threshold_value: parsed.threshold_value,
@@ -163,6 +173,9 @@ fn infer_vertical_from_event(event: &MarketStateEvent) -> Option<MarketVertical>
     let title = event.title.to_ascii_uppercase();
     if ticker.contains("HIGH") || title.contains("TEMP") || title.contains("WEATHER") {
         return Some(MarketVertical::Weather);
+    }
+    if ticker.contains("FED") || ticker.contains("FOMC") {
+        return Some(MarketVertical::Fed);
     }
     if ticker.contains("NBA") || ticker.contains("NFL") || ticker.contains("TABLETENNIS") {
         return Some(MarketVertical::Sports);
@@ -218,6 +231,7 @@ pub fn parse_market_metadata(
 fn vertical_name(vertical: MarketVertical) -> String {
     match vertical {
         MarketVertical::Weather  => "weather",
+        MarketVertical::Fed      => "fed",
         MarketVertical::Sports   => "sports",
         MarketVertical::Esports  => "esports",
         MarketVertical::Finance  => "finance",

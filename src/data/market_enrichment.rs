@@ -25,6 +25,10 @@ pub struct EnrichmentConfig {
     /// When set, Philadelphia high-temp markets get a calibrated XGBoost probability
     /// instead of the raw NOAA temperature signal. Set via WEATHER_SPECIALIST_URL.
     pub weather_specialist_url: Option<String>,
+    /// Optional URL of the FedWatcher sidecar (e.g. http://127.0.0.1:8768).
+    /// When set, Fed/FOMC rate markets get a calibrated TF-IDF+MLP probability
+    /// instead of the bucket model. Set via FED_SPECIALIST_URL.
+    pub fed_specialist_url: Option<String>,
     /// Optional URL of the CryptoPredictor sidecar (e.g. http://127.0.0.1:8766).
     /// When set, KXBTCD/KXETHD/KXSOLD/KXXRPD markets get a GBM threshold-crossing
     /// probability instead of the sentiment + price-distance heuristic. Set via
@@ -44,6 +48,7 @@ impl Default for EnrichmentConfig {
                 .or_else(|| Some("https://api.alternative.me/fng/?limit=1".to_string())),
             esports_api_url: std::env::var("ESPORTS_API_URL").ok(),
             weather_specialist_url: std::env::var("WEATHER_SPECIALIST_URL").ok(),
+            fed_specialist_url: std::env::var("FED_SPECIALIST_URL").ok(),
             crypto_specialist_url: std::env::var("CRYPTO_SPECIALIST_URL").ok(),
         }
     }
@@ -72,12 +77,21 @@ pub struct MarketEnrichment {
     /// WEATHER_SPECIALIST_URL is configured. Used as a direct fair_prob_yes
     /// override in the forecast layer, bypassing the general bucket model.
     pub specialist_prob_yes: Option<f64>,
+    /// Calibrated TF-IDF+MLP probability from the FedWatcher sidecar.
+    /// Only populated for Fed/FOMC rate tickers when FED_SPECIALIST_URL is configured.
+    /// Used as a direct fair_prob_yes override in the forecast layer.
+    pub fed_specialist_prob_yes: Option<f64>,
+    /// Calibrated probability from the Crypto specialist sidecar.
+    /// Only populated when CRYPTO_SPECIALIST_URL is configured.
+    /// Used as a direct fair_prob_yes override in the forecast layer.
+    pub crypto_specialist_prob_yes: Option<f64>,
     pub generated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketVertical {
     Weather,
+    Fed,
     Sports,
     Esports,
     Finance,
@@ -135,6 +149,8 @@ impl MarketEnricher {
         let mut esports_signal = None;
         let mut finance_price_signal = None;
         let mut specialist_prob_yes = None;
+        let mut fed_specialist_prob_yes = None;
+        let mut crypto_specialist_prob_yes = None;
 
         match vertical {
             MarketVertical::Weather => {
@@ -175,6 +191,9 @@ impl MarketEnricher {
                 };
             }
             MarketVertical::Crypto => {
+                if self.cfg.crypto_specialist_url.is_some() {
+                    crypto_specialist_prob_yes = self.fetch_crypto_specialist_prob(&market.ticker).await;
+                }
                 crypto_sentiment_signal = match self.fetch_crypto_sentiment_signal().await {
                     Ok(v) => v,
                     Err(err) => {
@@ -198,6 +217,11 @@ impl MarketEnricher {
                     }
                 }
             }
+            MarketVertical::Fed => {
+                if self.cfg.fed_specialist_url.is_some() {
+                    fed_specialist_prob_yes = self.fetch_fed_specialist_prob(&market.ticker).await;
+                }
+            }
             MarketVertical::Politics | MarketVertical::Other => {}
         }
 
@@ -211,6 +235,8 @@ impl MarketEnricher {
             esports_signal,
             finance_price_signal,
             specialist_prob_yes,
+            fed_specialist_prob_yes,
+            crypto_specialist_prob_yes,
             generated_at: Utc::now(),
         };
         self.put_cached(&market.ticker, enriched.clone());
@@ -347,6 +373,103 @@ impl MarketEnricher {
             }
             Err(e) => {
                 eprintln!("specialist unavailable for {ticker}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Call the FedWatcher sidecar for a calibrated P(Fed rate hike).
+    /// Returns None on any error or when the sidecar signals data_source_ok=false,
+    /// so a down or stale sidecar never blocks a trading cycle.
+    async fn fetch_fed_specialist_prob(&self, ticker: &str) -> Option<f64> {
+        let base_url = self.cfg.fed_specialist_url.as_deref()?;
+        let url = format!("{}/predict?ticker={}", base_url, ticker);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct FedResp {
+                    probability:    f64,
+                    data_source_ok: bool,
+                    data_age_secs:  i64,
+                }
+                match r.json::<FedResp>().await {
+                    Ok(body) if body.data_source_ok && body.data_age_secs >= 0 => {
+                        Some(body.probability.clamp(0.001, 0.999))
+                    }
+                    Ok(body) => {
+                        eprintln!(
+                            "fed specialist suppressed for {ticker}: \
+                             data_source_ok={} age={}s",
+                            body.data_source_ok, body.data_age_secs
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("fed specialist parse error for {ticker}: {e}");
+                        None
+                    }
+                }
+            }
+            Ok(r) => {
+                eprintln!("fed specialist HTTP {} for {ticker}", r.status());
+                None
+            }
+            Err(e) => {
+                eprintln!("fed specialist unavailable for {ticker}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Call the Crypto specialist sidecar for a calibrated P(price > threshold).
+    /// Returns None on any error or when data_source_ok=false.
+    async fn fetch_crypto_specialist_prob(&self, ticker: &str) -> Option<f64> {
+        let base_url = self.cfg.crypto_specialist_url.as_deref()?;
+        let url = format!("{}/predict?ticker={}", base_url, ticker);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct CryptoResp {
+                    probability:    f64,
+                    data_source_ok: bool,
+                    data_age_secs:  i64,
+                }
+                match r.json::<CryptoResp>().await {
+                    Ok(body) if body.data_source_ok && body.data_age_secs >= 0 => {
+                        Some(body.probability.clamp(0.001, 0.999))
+                    }
+                    Ok(body) => {
+                        eprintln!(
+                            "crypto specialist suppressed for {ticker}: \
+                             data_source_ok={} age={}s",
+                            body.data_source_ok, body.data_age_secs
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("crypto specialist parse error for {ticker}: {e}");
+                        None
+                    }
+                }
+            }
+            Ok(r) => {
+                eprintln!("crypto specialist HTTP {} for {ticker}", r.status());
+                None
+            }
+            Err(e) => {
+                eprintln!("crypto specialist unavailable for {ticker}: {e}");
                 None
             }
         }
@@ -659,6 +782,11 @@ fn city_coords(city_code: &str) -> Option<&'static str> {
     }
 }
 
+fn is_fed_ticker(ticker: &str) -> bool {
+    let upper = ticker.to_ascii_uppercase();
+    upper.contains("FED") || upper.contains("FOMC")
+}
+
 /// Extract the city code from a weather ticker like "KXHIGHCHI-26FEB16-T45" → "CHI".
 /// Strips the "KXHIGH" prefix and takes the next alphabetic segment before any dash or digit.
 fn extract_city_from_ticker(ticker: &str) -> Option<&str> {
@@ -681,18 +809,21 @@ fn extract_city_from_ticker(ticker: &str) -> Option<&str> {
 /// Without this, top-N by volume can be entirely crypto or sports, leaving
 /// weather markets — which benefit most from NOAA enrichment — with zero slots.
 pub fn select_for_enrichment(markets: &[ScannedMarket], limit: usize) -> Vec<&ScannedMarket> {
-    // Bucket priority: Weather(0) → Esports(1) → Finance(2) → Sports(3) → Politics(4) → Crypto(5) → Other(6)
+    // Bucket priority: Weather(0) → Fed(1) → Esports(2) → Finance(3) → Sports(4) → Politics(5) → Crypto(6) → Other(7)
+    // Fed is second only to Weather: both have specialist sidecars that provide direct overrides,
+    // so they must be enriched every cycle to produce a useful forecast.
     // Finance gets priority before Sports: its price signal is immediately actionable.
-    let mut buckets: [Vec<&ScannedMarket>; 7] = Default::default();
+    let mut buckets: [Vec<&ScannedMarket>; 8] = Default::default();
     for m in markets {
         let idx = match detect_vertical(m) {
             MarketVertical::Weather  => 0,
-            MarketVertical::Esports  => 1,
-            MarketVertical::Finance  => 2,
-            MarketVertical::Sports   => 3,
-            MarketVertical::Politics => 4,
-            MarketVertical::Crypto   => 5,
-            MarketVertical::Other    => 6,
+            MarketVertical::Fed      => 1,
+            MarketVertical::Esports  => 2,
+            MarketVertical::Finance  => 3,
+            MarketVertical::Sports   => 4,
+            MarketVertical::Politics => 5,
+            MarketVertical::Crypto   => 6,
+            MarketVertical::Other    => 7,
         };
         buckets[idx].push(m);
     }
@@ -702,7 +833,7 @@ pub fn select_for_enrichment(markets: &[ScannedMarket], limit: usize) -> Vec<&Sc
         bucket.sort_by(|a, b| b.volume.total_cmp(&a.volume));
     }
 
-    let mut cursors = [0usize; 7];
+    let mut cursors = [0usize; 8];
     let mut result = Vec::with_capacity(limit);
     loop {
         let mut added_any = false;
@@ -781,6 +912,11 @@ pub fn detect_vertical(market: &ScannedMarket) -> MarketVertical {
         || text.contains("copper close price")
     {
         return MarketVertical::Finance;
+    }
+
+    // Fed — Federal Reserve rate decisions (own vertical: specialist sidecar provides direct override)
+    if text.contains("kxfed") || text.contains("kxfomc") {
+        return MarketVertical::Fed;
     }
 
     // Politics — elections, legislation, government mentions

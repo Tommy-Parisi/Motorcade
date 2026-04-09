@@ -30,6 +30,14 @@ pub struct MarketStateEvent {
     /// None when no specialist is configured or the sidecar returned data_source_ok=false.
     #[serde(default)]
     pub specialist_prob_yes: Option<f64>,
+    /// Calibrated probability from the FedWatcher sidecar.
+    /// None when FED_SPECIALIST_URL is not configured or sidecar returned data_source_ok=false.
+    #[serde(default)]
+    pub fed_specialist_prob_yes: Option<f64>,
+    /// Calibrated probability from the Crypto specialist sidecar.
+    /// None when CRYPTO_SPECIALIST_URL is not configured or sidecar returned data_source_ok=false.
+    #[serde(default)]
+    pub crypto_specialist_prob_yes: Option<f64>,
     pub source: String,
     pub cycle_id: String,
 }
