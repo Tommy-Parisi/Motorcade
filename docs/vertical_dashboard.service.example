@@ -1,0 +1,17 @@
+[Unit]
+Description=Motorcade vertical dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/Motorcade
+Environment=BOT_RESEARCH_DIR=/path/to/Motorcade/var/research
+Environment=VERTICAL_DASHBOARD_PORT=8080
+Environment=VERTICAL_DASHBOARD_REFRESH_SECONDS=60
+ExecStart=/path/to/Motorcade/scripts/start_vertical_dashboard.sh
+Restart=always
+RestartSec=5
+User=tommy
+
+[Install]
+WantedBy=multi-user.target
