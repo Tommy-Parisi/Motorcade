@@ -1,0 +1,3 @@
+[submodule "sidecars/hawkwatchers"]
+	path = sidecars/hawkwatchers
+	url = https://github.com/Tommy-Parisi/hawkwatchers-sidecar
