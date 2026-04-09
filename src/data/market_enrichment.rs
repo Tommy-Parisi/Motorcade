@@ -208,14 +208,6 @@ impl MarketEnricher {
                         None
                     }
                 };
-                // Shadow: call crypto specialist and log prediction, but do NOT set
-                // specialist_prob_yes — bucket model remains authoritative until the
-                // sidecar accumulates enough shadow predictions to validate calibration.
-                if let Some(url) = self.cfg.crypto_specialist_url.as_deref() {
-                    if let Some(p) = self.fetch_specialist_prob_from(&market.ticker, url).await {
-                        eprintln!("crypto_specialist_shadow ticker={} prob={:.4}", market.ticker, p);
-                    }
-                }
             }
             MarketVertical::Fed => {
                 if self.cfg.fed_specialist_url.is_some() {

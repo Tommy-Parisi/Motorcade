@@ -55,9 +55,8 @@ Forecast is handled by a **motorcade of out-of-process Python/FastAPI sidecars**
 
 **Active sidecars:**
 - `sidecars/weather/` — GEFS 31-member ensemble for all live weather cities (`KXHIGHT{BOS,DAL,HOU,SEA,PHX,SATX,LV,ATL,MIN,NOLA,DC,SFO,OKC}`). Cache keyed by `(city, date)`. Env: `WEATHER_SPECIALIST_URL` (default `http://127.0.0.1:8765`). Start: `sidecars/weather/start.sh`.
-
-**Shadow sidecars (do not override bucket model yet):**
-- `sidecars/crypto/` — GBM threshold-crossing probability for `KXBTCD-*`, `KXETHD-*`, `KXSOLD-*`, `KXXRPD-*`. Coinbase/Binance price feed, 30s refresh. Env: `CRYPTO_SPECIALIST_URL` (default unset). Shadow only: Rust logs predictions to stderr but does not set `specialist_prob_yes`. Promote after 1-week shadow validates calibration vs bucket. Start: `sidecars/crypto/start.sh`.
+- `sidecars/crypto/` — GBM threshold-crossing probability for `KXBTCD-*`, `KXETHD-*`, `KXSOLD-*`, `KXXRPD-*`. Coinbase/Binance price feed, 30s refresh. Env: `CRYPTO_SPECIALIST_URL` (default `http://127.0.0.1:8766`). Populates `crypto_specialist_prob_yes` as a hard override. Start: `sidecars/crypto/start.sh`.
+- `sidecars/hawkwatchers/` — TF-IDF + MLP classifier for `KXFED-*`, `KXFOMC-*`. Scrapes FOMC press releases; falls back to training CSV if network is blocked. Env: `FED_SPECIALIST_URL` (default `http://127.0.0.1:8768`). Managed by systemd (`fed-sidecar.service`). Populates `fed_specialist_prob_yes` as a hard override. Start: `sidecars/hawkwatchers/start_fed_sidecar.sh`.
 
 **Operating modes** (set via `BOT_POLICY_MODE` in `.env`):
 - `legacy` — only legacy path (current trusted mode)
@@ -100,7 +99,7 @@ The entire `var/` tree (`cycles/`, `logs/`, `research/`, `features/`, `models/`,
 See `docs/execution_aware_prediction_plan.md` for the full roadmap.
 
 1. **Execution model fill-probability labels are meaningless on paper data.** The paper execution path always fills (`limit >= ask` is true for all candidates), so `fill_30s`/`fill_5m` labels have zero variance. Organic paper rows DO help `markout_5m_bps` and `fill_price` calibration — but fill probability requires live-real data. Active mode is gated on live-real markout, not paper row count.
-2. **Bucket model underperforms market mid in shadow** (-18.3% Brier lift, 04-06 audit). Expected — enrichment signals are null for non-weather verticals. Fix: build CryptoPredictor sidecar next, which covers the highest-volume shadow rows (crypto ~96% of resolved markets).
+2. **Bucket model underperforms market mid in shadow** (-18.3% Brier lift, 04-06 audit). Crypto and FED specialist sidecars now active — bucket model is now only the fallback for uncovered verticals (politics, finance, esports, sports).
 3. **Execution GBT not started.** Execution model is still a bucket lookup table. Do not prioritize until there are 50+ live-real rows with observed fill variance.
 4. **Current apparent edge is time-decay capture, not deep modeling.** Crypto and metals performance (~96-100% win rate) comes from buying near-resolution daily markets that Kalshi prices stale. This is a real but fragile and thin edge — it doesn't scale and compresses as liquidity improves. Durable alpha requires sidecar-driven probabilistic forecasts.
 
@@ -122,7 +121,10 @@ See `docs/execution_aware_prediction_plan.md` for the full roadmap.
 | `sidecars/weather/sidecar.py` | Weather specialist sidecar — GEFS ensemble, multi-city |
 | `sidecars/weather/gefs_fetcher.py` | NOMADS GRIB2 fetch + CityConfig dataclass |
 | `sidecars/weather/ensemble_predictor.py` | Vote-fraction P(high > threshold) with bias correction table |
-| `src/data/market_enrichment.rs` | Calls weather sidecar; populates `specialist_prob_yes` |
+| `sidecars/crypto/sidecar.py` | Crypto specialist sidecar — GBM threshold-crossing probability |
+| `sidecars/hawkwatchers/sidecar.py` | FED specialist sidecar — TF-IDF + MLP on FOMC press releases |
+| `sidecars/hawkwatchers/train.py` | Trains TF-IDF + MLP; writes `models/best_clf.joblib` |
+| `src/data/market_enrichment.rs` | Calls all sidecars; populates `specialist_prob_yes`, `fed_specialist_prob_yes`, `crypto_specialist_prob_yes` |
 
 ## Analysis Scripts (Python)
 

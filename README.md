@@ -98,7 +98,7 @@ Implemented, but recommended in `shadow` mode for now.
 ## Recommended Reality Check
 
 - The legacy trading loop is operational and is what executes trades in both `shadow` and `live` mode.
-- The forecast model is promising but underperforms market mid on crypto (~96% of volume) because no CryptoPredictor sidecar exists yet.
+- The forecast model uses specialist sidecars for weather (GEFS), crypto (GBM), and FED/FOMC (TF-IDF+MLP) markets. The bucket model is the fallback for all other verticals.
 - The execution model's `fill_30s`/`fill_5m` labels are meaningless on paper data — the paper path always fills. Organic paper rows help `markout` and `fill_price` calibration only. Fill probability requires live-real data.
 - `BOT_POLICY_MODE=active` is gated on actual live trade performance (markout), not estimated ERPNL from the execution model.
 
@@ -181,12 +181,13 @@ The enricher lives in `src/data/market_enrichment.rs`.
 
 It adds lightweight external context based on a coarse market vertical classification:
 
-- weather: NOAA
+- weather: GEFS ensemble via `sidecars/weather/` (`WEATHER_SPECIALIST_URL`)
+- crypto: GBM threshold-crossing probability via `sidecars/crypto/` (`CRYPTO_SPECIALIST_URL`)
+- fed/fomc: TF-IDF + MLP on FOMC press releases via `sidecars/hawkwatchers/` (`FED_SPECIALIST_URL`)
 - sports: optional injury feed
-- crypto: optional sentiment feed
 - other: no enrichment
 
-This is not a full prediction engine. It is a shallow signal layer that the legacy valuation engine and newer feature builders can use.
+Specialist sidecars return a calibrated probability that directly overrides the bucket model for their vertical. Sidecar down = silent fallback to bucket, trading continues uninterrupted.
 
 ## Valuation Layer
 

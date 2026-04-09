@@ -156,7 +156,8 @@ def _refresh(city_code: str, target_date: date) -> None:
 
 
 def _background_refresh() -> None:
-    """Background thread: refresh all cities × {today, +1, +2} every GEFS_REFRESH_SECS.
+    """Background thread: refresh all cities × {-1, today, +1, +2} every GEFS_REFRESH_SECS.
+    Covers today-1 because markets for yesterday can still be open awaiting resolution.
     Covers today+2 because weather markets open ~14:00 UTC roughly 2 days before resolution.
     Sleeps first so startup warmup and first background fetch don't overlap."""
     time.sleep(GEFS_REFRESH_SECS)
@@ -166,7 +167,7 @@ def _background_refresh() -> None:
             # Deduplicate: multiple Philly aliases all point to same config — skip dupes.
             if CITY_MAP[city_code].name == "Philadelphia" and city_code != "PHI":
                 continue
-            for target_date in [today, today + timedelta(days=1), today + timedelta(days=2)]:
+            for target_date in [today - timedelta(days=1), today, today + timedelta(days=1), today + timedelta(days=2)]:
                 try:
                     _refresh(city_code, target_date)
                 except Exception as exc:
@@ -225,7 +226,7 @@ def _startup_warmup() -> None:
         if city_cfg.name in seen_names:
             continue
         seen_names.add(city_cfg.name)
-        for target_date in [today, today + timedelta(days=1), today + timedelta(days=2)]:
+        for target_date in [today - timedelta(days=1), today, today + timedelta(days=1), today + timedelta(days=2)]:
             try:
                 _refresh(city_code, target_date)
             except Exception as exc:
@@ -281,7 +282,10 @@ def predict(ticker: str):
 
     data_age_secs = int((datetime.now(timezone.utc) - result.fetch_time).total_seconds())
 
-    if data_age_secs > MAX_DATA_AGE_SECS:
+    # For past target dates the weather already happened — a refetch would not
+    # produce better data, so the age limit does not apply.
+    today = datetime.now(timezone.utc).date()
+    if target_date >= today and data_age_secs > MAX_DATA_AGE_SECS:
         logger.warning(
             f"predict: stale cache for city={city_code} date={target_date} "
             f"(age={data_age_secs}s > max={MAX_DATA_AGE_SECS}s)"

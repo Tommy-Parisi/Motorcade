@@ -28,16 +28,17 @@ returning garbage is treated identically to sidecar being down.
 
 ---
 
-## Current State (2026-04-06)
+## Current State (2026-04-09)
 
 | Component | Status |
 |---|---|
-| Weather sidecar (`sidecars/weather/`) | **Live.** GEFS 31-member ensemble, all 13 KXHIGHT cities. Replaced old XGBoost/Philadelphia-only version. First sidecar-backed weather trades accumulating now. |
-| Crypto sidecar (`sidecars/crypto/`) | **Built, shadow mode.** GBM threshold-crossing probability. Rust calls sidecar, logs predictions, but does NOT override bucket model yet. |
-| Bucket model | Permanent fallback for all non-specialist verticals. Works. |
+| Weather sidecar (`sidecars/weather/`) | **Live.** GEFS 31-member ensemble, all 14 KXHIGHT cities. Hard override via `specialist_prob_yes`. |
+| Crypto sidecar (`sidecars/crypto/`) | **Live.** GBM threshold-crossing probability for BTC, ETH, SOL, XRP. Hard override via `crypto_specialist_prob_yes`. Promoted from shadow 2026-04-09. |
+| FED sidecar (`sidecars/hawkwatchers/`) | **Live.** TF-IDF + MLP on FOMC press releases. Hard override via `fed_specialist_prob_yes`. Managed by systemd. `KXFED`/`KXFOMC` added to scan allowlist. |
+| Bucket model | Permanent fallback for all non-specialist verticals (politics, finance, esports, sports). |
 | Execution model | Bucket lookup table. Fill probability labels meaningless on paper data — requires live-real fills. |
 | Policy layer | Wired in shadow mode. Active mode gated on live-real markout ≥ 0 over 50+ rows. |
-| Live trading | Not started. Simulation shows +1.0% ROI with sports + oil removed (pre-sidecar weather). Waiting on weather validation. |
+| Live trading | Not started. Running paper + shadow to accumulate sidecar-backed trade data. Waiting on `simulate_pnl.py` showing positive ROI with all three specialist sidecars active. |
 
 **Sports and oil removed from allowlists** (2026-04-06):
 - Sports: 0% win rate on resolved paper trades
@@ -48,23 +49,23 @@ returning garbage is treated identically to sidecar being down.
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Rust Bot (main)                        │
-│   scan → enrich → forecast → policy → execute            │
-│                      │                                    │
-│          specialist_prob_yes (Option<f64>)                │
-│          overrides bucket model when present              │
-└──────────────┬────────────────────────────────────────────┘
-               │  HTTP (3s timeout, graceful fallback)
-    ┌──────────┴──────────────────────────────┐
-    │                                         │
-┌───▼─────────────────────┐   ┌──────────────▼──────────────┐
-│   WeatherPredictor ✓    │   │   CryptoPredictor (shadow) ✓│
-│   sidecars/weather/     │   │   sidecars/crypto/          │
-│   GEFS 31-member        │   │   GBM threshold probability │
-│   13 KXHIGHT cities     │   │   BTC, ETH, SOL, XRP        │
-│   Live since 2026-04-06 │   │   Scaffolded, not built     │
-└─────────────────────────┘   └─────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      Rust Bot (main)                              │
+│   scan → enrich → forecast → policy → execute                    │
+│                      │                                            │
+│   specialist_prob_yes / fed_specialist_prob_yes /                 │
+│   crypto_specialist_prob_yes — hard overrides when present        │
+└──────────┬─────────────────┬──────────────────┬───────────────────┘
+           │                 │                  │
+           │  HTTP (3s timeout, graceful fallback on all)
+           │                 │                  │
+┌──────────▼──────────┐ ┌────▼─────────────┐ ┌─▼────────────────────┐
+│  WeatherPredictor ✓ │ │ CryptoPredictor ✓│ │  FedWatcher ✓        │
+│  sidecars/weather/  │ │ sidecars/crypto/ │ │  sidecars/hawkwatchers│
+│  GEFS 31-member     │ │ GBM threshold    │ │  TF-IDF + MLP        │
+│  14 KXHIGHT cities  │ │ BTC/ETH/SOL/XRP  │ │  FOMC press releases │
+│  :8765              │ │ :8766            │ │  :8768 (systemd)     │
+└─────────────────────┘ └──────────────────┘ └──────────────────────┘
 ```
 
 ---
@@ -87,48 +88,11 @@ serves immediately (returning `data_source_ok: false` until cache warms).
 
 ## Roadmap
 
-### Phase 1 — CryptoPredictor Sidecar
+### Phase 1 — CryptoPredictor Sidecar ✓ COMPLETE (2026-04-09)
 
-**Goal:** Cover `KXBTCD-*`, `KXETHD-*`, `KXSOLD-*`, `KXXRPD-*`.
-
-**Approach:** GBM threshold-crossing probability — NOT price prediction.
-
-```
-P(S_T > K) = N( (log(S/K) + (μ - σ²/2)·T) / (σ·√T) )
-```
-
-Where `S` = current spot, `K` = strike, `T` = time to 5pm EDT settlement,
-`σ` = realized vol from recent OHLCV, `μ` = 0 (intraday drift negligible).
-No training required. Works immediately from exchange price data.
-
-**Do not use LSTM/price-prediction models.** We need P(price > threshold),
-not the price itself. The GBM formula is analytically exact under standard
-assumptions, interpretable, and requires no historical collection period.
-
-**Price feed:** Coinbase Advanced Trade API (public endpoints, no auth).
-Binance REST as fallback. Cache spot + OHLCV in background thread every 30s.
-
-**Vol estimation:** close-to-close realized vol over 15m/1h/4h windows.
-Use shortest window with sufficient candles — intraday crypto vol is fast-moving.
-
-**Settlement time:** all Kalshi daily crypto markets settle at 17:00 EDT.
-
-**Rust wiring:**
-- `CRYPTO_SPECIALIST_URL` env var wired into `EnrichmentConfig` (default unset)
-- When set, Rust calls the sidecar on every crypto market hit, logs
-  `crypto_specialist_shadow ticker=... prob=...` to stderr, but does **not**
-  write to `specialist_prob_yes` — bucket model remains authoritative
-
-**Why shadow first:** crypto is already working as-is (time-decay edge on
-high-probability markets). Promoting GBM predictions immediately risks
-degrading an edge that's real money once live. Shadow mode lets us verify
-GBM calibration against resolved outcomes before trusting it with sizing.
-
-**Promote to active** (flip `specialist_prob_yes` assignment in
-`market_enrichment.rs`) when 1-week shadow shows GBM Brier score better
-than bucket on crypto markets.
-
-**Gate:** 1-week shadow holdout showing GBM better calibrated than bucket.
+GBM threshold-crossing probability for `KXBTCD-*`, `KXETHD-*`, `KXSOLD-*`, `KXXRPD-*`.
+Running on `:8766`. `crypto_specialist_prob_yes` is a hard override in the forecast layer.
+Coinbase/Binance price feed, 30s refresh. All four assets (BTC, ETH, SOL, XRP) live-cached.
 
 ---
 
@@ -216,10 +180,10 @@ timestamps — injury news expires at game tip-off, not at data staleness.
 Cycle latency matters: if edge window is tighter than cycle, push events
 into the main loop rather than polling.
 
-**Economic indicators (Fed rate, CPI)** — only build with a clear signal
-hypothesis. Efficient market; hard to beat without proprietary data.
-Reference: hawkwatchers (NLP on Fed press releases) as a lightweight
-first signal layer.
+**Economic indicators (Fed rate, CPI)** — FED sidecar deployed 2026-04-09
+(`sidecars/hawkwatchers/`, systemd-managed on `:8768`). TF-IDF + MLP on FOMC
+press releases, NN LOOCV acc=0.74, trained through March 2026. `KXFED`/`KXFOMC`
+added to `BOT_SCAN_SERIES_ALLOWLIST`. CPI and other macro indicators remain unbuilt.
 
 ---
 
@@ -228,7 +192,8 @@ first signal layer.
 | Gate | Condition |
 |---|---|
 | Go live (`trade.sh`) | `simulate_pnl.py` shows positive ROI with guards applied |
-| Crypto sidecar to shadow | GBM predictions better calibrated than bucket on 1-week holdout |
+| ~~Crypto sidecar to active~~ | ✓ Done 2026-04-09 |
+| ~~FED sidecar deployed~~ | ✓ Done 2026-04-09 |
 | Execution GBT to shadow | Improves fill ranking vs. bucket on holdout |
 | Policy active | ≥ 50 live-real rows, mean `markout_5m_bps` ≥ 0 (code-enforced) |
 | Policy active (normal sizing) | 2 weeks capped-mode data, no vertical worse than legacy |

@@ -616,6 +616,25 @@ impl ClaudeValuationEngine {
             .iter()
             .map(|i| {
                 let mid = market_mid_prob_yes(&i.market).unwrap_or(0.5);
+
+                // If a specialist sidecar returned a calibrated probability, use it
+                // directly and skip the heuristic bias. Mirrors the override in
+                // src/models/forecast.rs so paper trades benefit from the sidecar too.
+                if let Some(prob) = i.enrichment.as_ref().and_then(|e| e.specialist_prob_yes) {
+                    return MarketValuation {
+                        ticker: i.market.ticker.clone(),
+                        fair_prob_yes: prob,
+                        market_mid_prob_yes: mid,
+                        yes_ask_cents: i.market.yes_ask_cents,
+                        yes_bid_cents: i.market.yes_bid_cents,
+                        market_volume: i.market.volume,
+                        spread_cents: i.market.spread_cents(),
+                        confidence: 0.90,
+                        rationale: "specialist_sidecar".to_string(),
+                        stale_after: Utc::now() + chrono::Duration::minutes(10),
+                    };
+                }
+
                 let enrich_bias = i
                     .enrichment
                     .as_ref()
@@ -646,9 +665,14 @@ impl ClaudeValuationEngine {
             .as_ref()
             .map(|e| enrichment_bias(e, &i.market.ticker))
             .unwrap_or(0.0);
+        let specialist = i
+            .enrichment
+            .as_ref()
+            .and_then(|e| e.specialist_prob_yes)
+            .unwrap_or(-1.0);
         format!(
-            "{}|{:.4}|{:.1}|{:.4}",
-            i.market.ticker, mid, i.market.volume, enrich
+            "{}|{:.4}|{:.1}|{:.4}|{:.4}",
+            i.market.ticker, mid, i.market.volume, enrich, specialist
         )
     }
 

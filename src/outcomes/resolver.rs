@@ -258,10 +258,10 @@ fn parse_resolution_status(market: &Value) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if matches!(
-        status.as_str(),
-        "settled" | "resolved" | "finalized" | "closed" | "expired"
-    ) {
+    // "closed" means trading has stopped but settlement hasn't happened yet —
+    // Kalshi posts yes_result/settlement_value later. Don't treat it as resolved
+    // here; the outcome-field fallback below catches truly settled markets.
+    if matches!(status.as_str(), "settled" | "resolved" | "finalized") {
         return "resolved".to_string();
     }
     if matches!(status.as_str(), "canceled" | "void") {
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn parses_all_resolved_status_variants() {
-        for status in &["settled", "resolved", "finalized", "closed", "expired"] {
+        for status in &["settled", "resolved", "finalized"] {
             let v: Value = serde_json::json!({ "status": status });
             assert_eq!(
                 parse_resolution_status(&v),
@@ -391,6 +391,12 @@ mod tests {
                 status
             );
         }
+        // "closed" = trading stopped, settlement pending — not yet resolved without outcome fields
+        let v: Value = serde_json::json!({ "status": "closed" });
+        assert_eq!(parse_resolution_status(&v), "unresolved");
+        // "closed" + yes_result = actually resolved
+        let v: Value = serde_json::json!({ "status": "closed", "yes_result": true });
+        assert_eq!(parse_resolution_status(&v), "resolved");
         for status in &["canceled", "void"] {
             let v: Value = serde_json::json!({ "status": status });
             assert_eq!(
