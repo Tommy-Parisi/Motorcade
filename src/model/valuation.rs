@@ -575,6 +575,12 @@ impl ClaudeValuationEngine {
             .map(|c| c.text.clone())
             .ok_or_else(|| ExecutionError::Exchange("claude missing text content".to_string()))?;
 
+        if response.stop_reason.as_deref() == Some("max_tokens") {
+            return Err(ExecutionError::RetryableExchange(
+                "claude response truncated (max_tokens)".to_string(),
+            ));
+        }
+
         // The assistant prefill consumed the opening '[', so we restore it before parsing.
         let content_with_prefix = format!("[{content_text}");
         let parsed = parse_claude_valuation_items(&content_with_prefix).map_err(|e| {
@@ -881,6 +887,7 @@ struct ClaudeMessage {
 #[derive(Debug, Deserialize)]
 struct ClaudeResponse {
     content: Vec<ClaudeContent>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

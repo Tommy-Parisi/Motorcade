@@ -425,6 +425,14 @@ impl MarketEnricher {
     /// Returns None on any error or when data_source_ok=false.
     async fn fetch_crypto_specialist_prob(&self, ticker: &str) -> Option<f64> {
         let base_url = self.cfg.crypto_specialist_url.as_deref()?;
+        // Sidecar only supports BTC/ETH/SOL/XRP daily contracts.
+        let supported = ticker.starts_with("KXBTCD-")
+            || ticker.starts_with("KXETHD-")
+            || ticker.starts_with("KXSOLD-")
+            || ticker.starts_with("KXXRPD-");
+        if !supported {
+            return None;
+        }
         let url = format!("{}/predict?ticker={}", base_url, ticker);
         let resp = self
             .http

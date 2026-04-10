@@ -658,6 +658,10 @@ impl RuntimeState {
             self.day = today;
             self.daily_realized_pnl = 0.0;
             self.recent_order_unix_secs.clear();
+            // Prior-day positions have all resolved; reset exposure and order tracking.
+            self.open_exposure_notional = 0.0;
+            self.open_orders.clear();
+            self.seen_client_order_ids.clear();
         }
     }
 }
