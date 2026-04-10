@@ -15,7 +15,9 @@ import bisect
 import html
 import json
 import math
+import os
 from collections import defaultdict
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,8 @@ WEATHER_PREFIXES = ("KXHIGHT",)
 FED_PREFIXES = ("KXFED", "KXFOMC")
 FEE_RATE = 0.07
 TRADE_TABLE_LIMIT = 18
+SIDECAR_ACTIVE_MAX_AGE_MINUTES = 20
+BOT_ACTIVE_MAX_AGE_MINUTES = 15
 
 SIDECARS = (
     {
@@ -78,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=60,
         help="Client-side browser refresh interval in seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--bot-log-path",
+        default=os.environ.get("VERTICAL_DASHBOARD_BOT_LOG_PATH", ""),
+        help="Optional path to a main bot log file to tail into the dashboard.",
+    )
+    parser.add_argument(
+        "--bot-log-lines",
+        type=int,
+        default=60,
+        help="How many trailing log lines to embed when --bot-log-path is set.",
     )
     return parser.parse_args()
 
@@ -374,7 +389,101 @@ def count_prediction_files(base: Path, since: str) -> int:
     return count
 
 
-def build_payload(research_dir: Path, since: str) -> dict[str, Any]:
+def latest_ts_from_rows(rows: list[dict[str, Any]]) -> datetime | None:
+    timestamps = [parse_ts(row.get("ts")) for row in rows]
+    valid = [ts for ts in timestamps if ts is not None]
+    return max(valid) if valid else None
+
+
+def latest_ts_in_tree(base: Path, since: str) -> datetime | None:
+    latest: datetime | None = None
+    if not base.exists():
+        return None
+    for date_dir in sorted(base.iterdir()):
+        if not date_dir.is_dir() or date_dir.name < since:
+            continue
+        for path in sorted(date_dir.glob("*.jsonl")):
+            for row in load_jsonl(path):
+                ts = parse_ts(row.get("ts"))
+                if ts is not None and (latest is None or ts > latest):
+                    latest = ts
+    return latest
+
+
+def status_payload(label: str, latest_ts: datetime | None, max_age_minutes: int, now: datetime) -> dict[str, Any]:
+    if latest_ts is None:
+        return {
+            "label": label,
+            "state": "inactive",
+            "text": "No recent data",
+            "latest_ts": None,
+            "age_minutes": None,
+            "max_age_minutes": max_age_minutes,
+        }
+    age_minutes = max(0.0, (now - latest_ts).total_seconds() / 60.0)
+    state = "active" if age_minutes <= max_age_minutes else "stale"
+    text = (
+        f"Active, updated {age_minutes:.1f}m ago"
+        if state == "active"
+        else f"Stale, last update {age_minutes:.1f}m ago"
+    )
+    return {
+        "label": label,
+        "state": state,
+        "text": text,
+        "latest_ts": isoformat(latest_ts),
+        "age_minutes": age_minutes,
+        "max_age_minutes": max_age_minutes,
+    }
+
+
+def read_log_tail(path: Path | None, line_count: int) -> dict[str, Any]:
+    if path is None:
+        return {
+            "path": None,
+            "exists": False,
+            "lines": [],
+            "line_count": 0,
+            "updated_at": None,
+            "error": None,
+        }
+    try:
+        exists = path.exists()
+        if not exists:
+            return {
+                "path": str(path),
+                "exists": False,
+                "lines": [],
+                "line_count": 0,
+                "updated_at": None,
+                "error": None,
+            }
+        tail = deque(maxlen=max(1, line_count))
+        with path.open(errors="replace") as handle:
+            for line in handle:
+                tail.append(line.rstrip("\n"))
+        updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        return {
+            "path": str(path),
+            "exists": True,
+            "lines": list(tail),
+            "line_count": len(tail),
+            "updated_at": isoformat(updated_at),
+            "error": None,
+        }
+    except OSError as exc:
+        return {
+            "path": str(path),
+            "exists": False,
+            "lines": [],
+            "line_count": 0,
+            "updated_at": None,
+            "error": str(exc),
+        }
+
+
+def build_payload(research_dir: Path, since: str, bot_log_path: Path | None = None, bot_log_lines: int = 60) -> dict[str, Any]:
+    now = datetime.now(tz=UTC)
     outcomes = load_outcomes(research_dir / "outcomes" / "outcomes.jsonl")
     orders = load_filled_orders(research_dir / "order_lifecycle", since)
     market_snapshots = load_market_snapshots(research_dir / "market_state", since)
@@ -382,17 +491,37 @@ def build_payload(research_dir: Path, since: str) -> dict[str, Any]:
 
     predictions: list[dict[str, Any]] = []
     prediction_sources: dict[str, Any] = {}
+    sidecar_status: dict[str, Any] = {}
     for sidecar in SIDECARS:
         rows = load_sidecar_predictions(sidecar["prediction_dir"], sidecar["key"], since, outcomes)
         predictions.extend(rows)
+        latest_prediction_ts = latest_ts_from_rows(rows)
         prediction_sources[sidecar["key"]] = {
             "dir": str(sidecar["prediction_dir"]),
             "file_count": count_prediction_files(sidecar["prediction_dir"], since),
             "prediction_count": len(rows),
+            "latest_prediction_ts": isoformat(latest_prediction_ts),
         }
+        sidecar_status[sidecar["key"]] = status_payload(
+            sidecar["label"],
+            latest_prediction_ts,
+            SIDECAR_ACTIVE_MAX_AGE_MINUTES,
+            now,
+        )
+
+    latest_market_state_ts = latest_ts_in_tree(research_dir / "market_state", since)
+    latest_order_ts = latest_ts_from_rows(orders)
+    bot_latest_ts_candidates = [ts for ts in (latest_market_state_ts, latest_order_ts) if ts is not None]
+    bot_latest_ts = max(bot_latest_ts_candidates) if bot_latest_ts_candidates else None
+    bot_status = status_payload("Main bot", bot_latest_ts, BOT_ACTIVE_MAX_AGE_MINUTES, now)
+    bot_status["signals"] = {
+        "latest_market_state_ts": isoformat(latest_market_state_ts),
+        "latest_order_ts": isoformat(latest_order_ts),
+    }
+    bot_log = read_log_tail(bot_log_path, bot_log_lines)
 
     return {
-        "generated_at": isoformat(datetime.now(tz=UTC)),
+        "generated_at": isoformat(now),
         "since": since,
         "research_dir": str(research_dir),
         "sidecars": [
@@ -413,6 +542,11 @@ def build_payload(research_dir: Path, since: str) -> dict[str, Any]:
             "order_lifecycle_files": count_jsonl_files(research_dir / "order_lifecycle", since),
             "prediction_sources": prediction_sources,
         },
+        "status": {
+            "bot": bot_status,
+            "sidecars": sidecar_status,
+        },
+        "bot_log": bot_log,
         "trades": trades,
         "predictions": predictions,
     }
@@ -525,6 +659,44 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
       color: var(--text);
       padding: 10px 14px;
       font-size: 0.93rem;
+    }}
+    .status-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }}
+    .status-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 0.88rem;
+      color: var(--text);
+      white-space: nowrap;
+    }}
+    .status-dot {{
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 0 4px rgba(255, 209, 102, 0.12);
+      flex: 0 0 auto;
+    }}
+    .status-pill.active .status-dot {{
+      background: var(--good);
+      box-shadow: 0 0 0 4px rgba(41, 211, 145, 0.12);
+    }}
+    .status-pill.stale .status-dot {{
+      background: var(--warn);
+      box-shadow: 0 0 0 4px rgba(255, 209, 102, 0.12);
+    }}
+    .status-pill.inactive .status-dot {{
+      background: var(--bad);
+      box-shadow: 0 0 0 4px rgba(255, 107, 107, 0.12);
     }}
     .range-picker {{
       grid-template-columns: repeat(auto-fit, minmax(120px, max-content));
@@ -697,6 +869,49 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
       font-size: 0.9rem;
       line-height: 1.55;
     }}
+    .log-card {{
+      margin-top: 26px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+      backdrop-filter: blur(10px);
+    }}
+    .log-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 14px;
+    }}
+    .log-title {{
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: -0.03em;
+    }}
+    .log-copy {{
+      margin: 6px 0 0;
+      color: #c1d0e2;
+      line-height: 1.5;
+    }}
+    .log-meta {{
+      color: var(--muted);
+      font-size: 0.86rem;
+    }}
+    .log-terminal {{
+      margin: 0;
+      padding: 16px;
+      border-radius: 18px;
+      background: #050a12;
+      border: 1px solid rgba(173, 201, 235, 0.1);
+      color: #d7fbe8;
+      font: 12.5px/1.55 "SFMono-Regular", "Menlo", "Consolas", monospace;
+      overflow: auto;
+      max-height: 460px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
     @media (max-width: 760px) {{
       .shell {{
         width: min(100vw - 20px, 1480px);
@@ -728,11 +943,13 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
           <div class="meta-chip"><strong>Date filter:</strong> {since_label}</div>
           <div class="meta-chip"><strong>Research dir:</strong> {research_dir}</div>
         </div>
+        <div class="status-row" id="global-status-row"></div>
         <div class="range-picker" id="range-picker"></div>
       </div>
     </section>
     <section class="summary-grid" id="summary-grid"></section>
     <section class="section-grid" id="section-grid"></section>
+    <section class="log-card" id="bot-log-card"></section>
     <div class="footer">
       Snapshot file: <code>vertical_dashboard.html</code>. Reloading the page refreshes the view of the current snapshot;
       rerun <code>python3 scripts/render_vertical_dashboard.py</code> to bake in the latest research/output rows.
@@ -938,6 +1155,29 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
       `).join("");
     }}
 
+    function renderStatusPill(status) {{
+      const title = status.latest_ts ? `${{status.text}}` : status.text;
+      return `
+        <div class="status-pill ${{status.state}}" title="${{title}}">
+          <span class="status-dot"></span>
+          <strong>${{status.label}}:</strong> ${{status.state.toUpperCase()}}
+        </div>
+      `;
+    }}
+
+    function renderGlobalStatus() {{
+      const globalStatusRow = document.getElementById("global-status-row");
+      const statuses = [PAYLOAD.status.bot, ...PAYLOAD.sidecars.map((sidecar) => PAYLOAD.status.sidecars[sidecar.key])];
+      globalStatusRow.innerHTML = statuses.map(renderStatusPill).join("");
+    }}
+
+    function escapeHtml(value) {{
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }}
+
     function tradeRowMarkup(row) {{
       const badgeClass = row.resolved ? (row.won ? "win" : "loss") : "open";
       const badgeLabel = row.resolved ? (row.won ? "WIN" : "LOSS") : "OPEN";
@@ -984,7 +1224,11 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
                 <h2 class="section-title">${{sidecar.label}}</h2>
                 <p class="section-copy">${{sidecar.description}}</p>
               </div>
-              <div class="badge">${{tradeSummary.tradeCount}} fills</div>
+              <div>
+                <div class="badge">${{tradeSummary.tradeCount}} fills</div>
+                <div style="height:8px"></div>
+                ${{renderStatusPill(PAYLOAD.status.sidecars[sidecar.key])}}
+              </div>
             </div>
             <div class="mini-grid">
               <div class="mini-card">
@@ -1051,6 +1295,66 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
       sectionGrid.innerHTML = markup;
     }}
 
+    function renderBotLog() {{
+      const card = document.getElementById("bot-log-card");
+      const botLog = PAYLOAD.bot_log || {{}};
+      if (!botLog.path) {{
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">No bot log path configured for this dashboard snapshot yet.</p>
+            </div>
+          </div>
+          <div class="empty">
+            Set <code>VERTICAL_DASHBOARD_BOT_LOG_PATH</code> or pass <code>--bot-log-path</code> when rendering/serving
+            the dashboard to embed live bot output here.
+          </div>
+        `;
+        return;
+      }}
+      if (botLog.error) {{
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">Tailing <code>${{escapeHtml(botLog.path)}}</code></p>
+            </div>
+          </div>
+          <div class="empty">Could not read the log file: ${{escapeHtml(botLog.error)}}</div>
+        `;
+        return;
+      }}
+      if (!botLog.exists) {{
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">Configured path: <code>${{escapeHtml(botLog.path)}}</code></p>
+            </div>
+          </div>
+          <div class="empty">The configured log file does not exist yet.</div>
+        `;
+        return;
+      }}
+      const body = botLog.lines.length
+        ? escapeHtml(botLog.lines.join("\\n"))
+        : "Log file is present but currently empty.";
+      card.innerHTML = `
+        <div class="log-header">
+          <div>
+            <h2 class="log-title">Main Bot Log</h2>
+            <p class="log-copy">Live tail from <code>${{escapeHtml(botLog.path)}}</code></p>
+          </div>
+          <div class="log-meta">
+            ${{botLog.line_count}} lines shown<br>
+            Updated ${{fmtDate(botLog.updated_at)}}
+          </div>
+        </div>
+        <pre class="log-terminal">${{body}}</pre>
+      `;
+    }}
+
     function renderWindowPicker() {{
       const picker = document.getElementById("range-picker");
       picker.innerHTML = WINDOWS.map((item) => `
@@ -1067,9 +1371,11 @@ def render_html(payload: dict[str, Any], auto_refresh_seconds: int) -> str:
     }}
 
     function render() {{
+      renderGlobalStatus();
       renderWindowPicker();
       renderSummary(activeWindow);
       renderSections(activeWindow);
+      renderBotLog();
     }}
 
     render();
@@ -1087,8 +1393,9 @@ def main() -> None:
     args = parse_args()
     research_dir = Path(args.research_dir).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
+    bot_log_path = Path(args.bot_log_path).expanduser().resolve() if args.bot_log_path else None
 
-    payload = build_payload(research_dir, args.since)
+    payload = build_payload(research_dir, args.since, bot_log_path, args.bot_log_lines)
     output_path.write_text(render_html(payload, args.auto_refresh_seconds))
     print(f"Wrote dashboard to {output_path}")
 

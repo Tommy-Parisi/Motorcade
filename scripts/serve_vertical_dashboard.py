@@ -57,20 +57,45 @@ def parse_args() -> argparse.Namespace:
         default="0.0.0.0",
         help="HTTP host/interface to bind. Default: %(default)s",
     )
+    parser.add_argument(
+        "--bot-log-path",
+        default="",
+        help="Optional path to a main bot log file to tail into the dashboard.",
+    )
+    parser.add_argument(
+        "--bot-log-lines",
+        type=int,
+        default=60,
+        help="How many trailing log lines to embed when --bot-log-path is set.",
+    )
     return parser.parse_args()
 
 
-def render_once(research_dir: Path, output_path: Path, since: str, refresh_seconds: int) -> None:
-    payload = build_payload(research_dir, since)
+def render_once(
+    research_dir: Path,
+    output_path: Path,
+    since: str,
+    refresh_seconds: int,
+    bot_log_path: Path | None,
+    bot_log_lines: int,
+) -> None:
+    payload = build_payload(research_dir, since, bot_log_path, bot_log_lines)
     output_path.write_text(render_html(payload, refresh_seconds))
     print(f"[vertical-dashboard] rendered {output_path}", flush=True)
 
 
-def start_render_loop(research_dir: Path, output_path: Path, since: str, refresh_seconds: int) -> threading.Thread:
+def start_render_loop(
+    research_dir: Path,
+    output_path: Path,
+    since: str,
+    refresh_seconds: int,
+    bot_log_path: Path | None,
+    bot_log_lines: int,
+) -> threading.Thread:
     def loop() -> None:
         while True:
             try:
-                render_once(research_dir, output_path, since, refresh_seconds)
+                render_once(research_dir, output_path, since, refresh_seconds, bot_log_path, bot_log_lines)
             except Exception as exc:  # pragma: no cover - operational guardrail
                 print(f"[vertical-dashboard] render failed: {exc}", flush=True)
             time.sleep(max(1, refresh_seconds))
@@ -84,10 +109,11 @@ def main() -> None:
     args = parse_args()
     research_dir = Path(args.research_dir).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
+    bot_log_path = Path(args.bot_log_path).expanduser().resolve() if args.bot_log_path else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    render_once(research_dir, output_path, args.since, args.refresh_seconds)
-    start_render_loop(research_dir, output_path, args.since, args.refresh_seconds)
+    render_once(research_dir, output_path, args.since, args.refresh_seconds, bot_log_path, args.bot_log_lines)
+    start_render_loop(research_dir, output_path, args.since, args.refresh_seconds, bot_log_path, args.bot_log_lines)
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(output_path.parent))
     server = http.server.ThreadingHTTPServer((args.host, args.port), handler)

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="2">
-  <meta name="auto-refresh-seconds" content="2">
+  <meta http-equiv="refresh" content="45">
+  <meta name="auto-refresh-seconds" content="45">
   <title>Motorcade Vertical Dashboard</title>
   <style>
     :root {
@@ -96,6 +96,44 @@
       color: var(--text);
       padding: 10px 14px;
       font-size: 0.93rem;
+    }
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 0.88rem;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 0 4px rgba(255, 209, 102, 0.12);
+      flex: 0 0 auto;
+    }
+    .status-pill.active .status-dot {
+      background: var(--good);
+      box-shadow: 0 0 0 4px rgba(41, 211, 145, 0.12);
+    }
+    .status-pill.stale .status-dot {
+      background: var(--warn);
+      box-shadow: 0 0 0 4px rgba(255, 209, 102, 0.12);
+    }
+    .status-pill.inactive .status-dot {
+      background: var(--bad);
+      box-shadow: 0 0 0 4px rgba(255, 107, 107, 0.12);
     }
     .range-picker {
       grid-template-columns: repeat(auto-fit, minmax(120px, max-content));
@@ -268,6 +306,49 @@
       font-size: 0.9rem;
       line-height: 1.55;
     }
+    .log-card {
+      margin-top: 26px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+      backdrop-filter: blur(10px);
+    }
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 14px;
+    }
+    .log-title {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: -0.03em;
+    }
+    .log-copy {
+      margin: 6px 0 0;
+      color: #c1d0e2;
+      line-height: 1.5;
+    }
+    .log-meta {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+    .log-terminal {
+      margin: 0;
+      padding: 16px;
+      border-radius: 18px;
+      background: #050a12;
+      border: 1px solid rgba(173, 201, 235, 0.1);
+      color: #d7fbe8;
+      font: 12.5px/1.55 "SFMono-Regular", "Menlo", "Consolas", monospace;
+      overflow: auto;
+      max-height: 460px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     @media (max-width: 760px) {
       .shell {
         width: min(100vw - 20px, 1480px);
@@ -295,23 +376,25 @@
           </p>
         </div>
         <div class="hero-meta">
-          <div class="meta-chip"><strong>Generated:</strong> 2026-04-09T23:19:43.671029Z</div>
+          <div class="meta-chip"><strong>Generated:</strong> 2026-04-10T00:22:00.541562Z</div>
           <div class="meta-chip"><strong>Date filter:</strong> all time</div>
           <div class="meta-chip"><strong>Research dir:</strong> /Users/tommy/Projects/Kalshi/Motorcade/var/research</div>
         </div>
+        <div class="status-row" id="global-status-row"></div>
         <div class="range-picker" id="range-picker"></div>
       </div>
     </section>
     <section class="summary-grid" id="summary-grid"></section>
     <section class="section-grid" id="section-grid"></section>
+    <section class="log-card" id="bot-log-card"></section>
     <div class="footer">
       Snapshot file: <code>vertical_dashboard.html</code>. Reloading the page refreshes the view of the current snapshot;
       rerun <code>python3 scripts/render_vertical_dashboard.py</code> to bake in the latest research/output rows.
     </div>
   </div>
   <script>
-    const PAYLOAD = {"generated_at":"2026-04-09T23:19:43.671029Z","since":"0000-00-00","research_dir":"/Users/tommy/Projects/Kalshi/Motorcade/var/research","sidecars":[{"key":"weather","label":"Weather","accent":"#2ec4b6","description":"GEFS ensemble override for KXHIGHT* markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/weather/var/logs/gefs_predictions"},{"key":"crypto","label":"Crypto","accent":"#ff9f1c","description":"GBM threshold-crossing override for crypto daily markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/crypto/var/logs/crypto_predictions"},{"key":"fed","label":"Fed","accent":"#e71d36","description":"TF-IDF + MLP override for KXFED/KXFOMC markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/hawkwatchers/var/logs/fed_predictions"}],"source_counts":{"outcome_rows":0,"filled_orders":0,"trade_rows":0,"market_state_files":0,"order_lifecycle_files":0,"prediction_sources":{"weather":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/weather/var/logs/gefs_predictions","file_count":0,"prediction_count":0},"crypto":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/crypto/var/logs/crypto_predictions","file_count":0,"prediction_count":0},"fed":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/hawkwatchers/var/logs/fed_predictions","file_count":1,"prediction_count":1}}},"trades":[],"predictions":[{"ticker":"KXFEDRATE-26MAR-T5.5","ts":"2026-04-09T19:22:08.104336Z","vertical":"fed","probability":0.0003,"effective_probability":0.0003,"resolved":false,"outcome_yes":null}]};
-    const AUTO_REFRESH_SECONDS = 2;
+    const PAYLOAD = {"generated_at":"2026-04-10T00:22:00.541562Z","since":"0000-00-00","research_dir":"/Users/tommy/Projects/Kalshi/Motorcade/var/research","sidecars":[{"key":"weather","label":"Weather","accent":"#2ec4b6","description":"GEFS ensemble override for KXHIGHT* markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/weather/var/logs/gefs_predictions"},{"key":"crypto","label":"Crypto","accent":"#ff9f1c","description":"GBM threshold-crossing override for crypto daily markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/crypto/var/logs/crypto_predictions"},{"key":"fed","label":"Fed","accent":"#e71d36","description":"TF-IDF + MLP override for KXFED/KXFOMC markets","prediction_dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/hawkwatchers/var/logs/fed_predictions"}],"source_counts":{"outcome_rows":0,"filled_orders":0,"trade_rows":0,"market_state_files":0,"order_lifecycle_files":0,"prediction_sources":{"weather":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/weather/var/logs/gefs_predictions","file_count":0,"prediction_count":0,"latest_prediction_ts":null},"crypto":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/crypto/var/logs/crypto_predictions","file_count":0,"prediction_count":0,"latest_prediction_ts":null},"fed":{"dir":"/Users/tommy/Projects/Kalshi/Motorcade/sidecars/hawkwatchers/var/logs/fed_predictions","file_count":1,"prediction_count":1,"latest_prediction_ts":"2026-04-09T19:22:08.104336Z"}}},"status":{"bot":{"label":"Main bot","state":"inactive","text":"No recent data","latest_ts":null,"age_minutes":null,"max_age_minutes":15,"signals":{"latest_market_state_ts":null,"latest_order_ts":null}},"sidecars":{"weather":{"label":"Weather","state":"inactive","text":"No recent data","latest_ts":null,"age_minutes":null,"max_age_minutes":20},"crypto":{"label":"Crypto","state":"inactive","text":"No recent data","latest_ts":null,"age_minutes":null,"max_age_minutes":20},"fed":{"label":"Fed","state":"stale","text":"Stale, last update 299.9m ago","latest_ts":"2026-04-09T19:22:08.104336Z","age_minutes":299.87395376666666,"max_age_minutes":20}}},"bot_log":{"path":null,"exists":false,"lines":[],"line_count":0,"updated_at":null,"error":null},"trades":[],"predictions":[{"ticker":"KXFEDRATE-26MAR-T5.5","ts":"2026-04-09T19:22:08.104336Z","vertical":"fed","probability":0.0003,"effective_probability":0.0003,"resolved":false,"outcome_yes":null}]};
+    const AUTO_REFRESH_SECONDS = 45;
 
     const WINDOWS = [
       { key: "all", label: "All time", days: null },
@@ -509,6 +592,29 @@
       `).join("");
     }
 
+    function renderStatusPill(status) {
+      const title = status.latest_ts ? `${status.text}` : status.text;
+      return `
+        <div class="status-pill ${status.state}" title="${title}">
+          <span class="status-dot"></span>
+          <strong>${status.label}:</strong> ${status.state.toUpperCase()}
+        </div>
+      `;
+    }
+
+    function renderGlobalStatus() {
+      const globalStatusRow = document.getElementById("global-status-row");
+      const statuses = [PAYLOAD.status.bot, ...PAYLOAD.sidecars.map((sidecar) => PAYLOAD.status.sidecars[sidecar.key])];
+      globalStatusRow.innerHTML = statuses.map(renderStatusPill).join("");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
     function tradeRowMarkup(row) {
       const badgeClass = row.resolved ? (row.won ? "win" : "loss") : "open";
       const badgeLabel = row.resolved ? (row.won ? "WIN" : "LOSS") : "OPEN";
@@ -555,7 +661,11 @@
                 <h2 class="section-title">${sidecar.label}</h2>
                 <p class="section-copy">${sidecar.description}</p>
               </div>
-              <div class="badge">${tradeSummary.tradeCount} fills</div>
+              <div>
+                <div class="badge">${tradeSummary.tradeCount} fills</div>
+                <div style="height:8px"></div>
+                ${renderStatusPill(PAYLOAD.status.sidecars[sidecar.key])}
+              </div>
             </div>
             <div class="mini-grid">
               <div class="mini-card">
@@ -622,6 +732,66 @@
       sectionGrid.innerHTML = markup;
     }
 
+    function renderBotLog() {
+      const card = document.getElementById("bot-log-card");
+      const botLog = PAYLOAD.bot_log || {};
+      if (!botLog.path) {
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">No bot log path configured for this dashboard snapshot yet.</p>
+            </div>
+          </div>
+          <div class="empty">
+            Set <code>VERTICAL_DASHBOARD_BOT_LOG_PATH</code> or pass <code>--bot-log-path</code> when rendering/serving
+            the dashboard to embed live bot output here.
+          </div>
+        `;
+        return;
+      }
+      if (botLog.error) {
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">Tailing <code>${escapeHtml(botLog.path)}</code></p>
+            </div>
+          </div>
+          <div class="empty">Could not read the log file: ${escapeHtml(botLog.error)}</div>
+        `;
+        return;
+      }
+      if (!botLog.exists) {
+        card.innerHTML = `
+          <div class="log-header">
+            <div>
+              <h2 class="log-title">Main Bot Log</h2>
+              <p class="log-copy">Configured path: <code>${escapeHtml(botLog.path)}</code></p>
+            </div>
+          </div>
+          <div class="empty">The configured log file does not exist yet.</div>
+        `;
+        return;
+      }
+      const body = botLog.lines.length
+        ? escapeHtml(botLog.lines.join("\n"))
+        : "Log file is present but currently empty.";
+      card.innerHTML = `
+        <div class="log-header">
+          <div>
+            <h2 class="log-title">Main Bot Log</h2>
+            <p class="log-copy">Live tail from <code>${escapeHtml(botLog.path)}</code></p>
+          </div>
+          <div class="log-meta">
+            ${botLog.line_count} lines shown<br>
+            Updated ${fmtDate(botLog.updated_at)}
+          </div>
+        </div>
+        <pre class="log-terminal">${body}</pre>
+      `;
+    }
+
     function renderWindowPicker() {
       const picker = document.getElementById("range-picker");
       picker.innerHTML = WINDOWS.map((item) => `
@@ -638,9 +808,11 @@
     }
 
     function render() {
+      renderGlobalStatus();
       renderWindowPicker();
       renderSummary(activeWindow);
       renderSections(activeWindow);
+      renderBotLog();
     }
 
     render();
