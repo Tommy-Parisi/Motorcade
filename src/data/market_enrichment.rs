@@ -247,10 +247,12 @@ impl MarketEnricher {
 
     fn put_cached(&self, ticker: &str, data: MarketEnrichment) {
         if let Ok(mut guard) = self.cache.lock() {
+            let now = Instant::now();
+            guard.retain(|_, v| v.expires_at > now);
             guard.insert(
                 ticker.to_string(),
                 CacheEntry {
-                    expires_at: Instant::now() + Duration::from_secs(self.cfg.ttl_secs),
+                    expires_at: now + Duration::from_secs(self.cfg.ttl_secs),
                     data,
                 },
             );

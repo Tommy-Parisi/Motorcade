@@ -22,6 +22,10 @@ pub struct DatasetBuildConfig {
     pub enabled: bool,
     pub research_dir: PathBuf,
     pub output_dir: PathBuf,
+    /// Only load market-state and order-lifecycle events from the last N days.
+    /// Prevents in-process dataset builds from OOMing as research data grows.
+    /// Set via BOT_DATASET_MAX_DAYS (default 30). 0 = no limit (use with caution).
+    pub max_days: u64,
 }
 
 impl DatasetBuildConfig {
@@ -40,6 +44,10 @@ impl DatasetBuildConfig {
             output_dir: PathBuf::from(
                 std::env::var("BOT_FEATURES_DIR").unwrap_or_else(|_| "var/features".to_string()),
             ),
+            max_days: std::env::var("BOT_DATASET_MAX_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
         }
     }
 }
@@ -76,8 +84,8 @@ pub struct ExecutionTrainingRow {
 }
 
 pub async fn run_dataset_build(cfg: &DatasetBuildConfig) -> Result<(), ExecutionError> {
-    let market_events = load_market_state_events(&cfg.research_dir)?;
-    let order_events = load_order_lifecycle_events(&cfg.research_dir)?;
+    let market_events = load_market_state_events(&cfg.research_dir, cfg.max_days)?;
+    let order_events = load_order_lifecycle_events(&cfg.research_dir, cfg.max_days)?;
     let outcomes = load_outcomes(&cfg.research_dir)?;
 
     let forecast_rows = build_forecast_dataset(&market_events, &outcomes);
@@ -441,7 +449,23 @@ fn event_root_from_ticker(ticker: &str) -> String {
     }
 }
 
-fn load_market_state_events(root: &Path) -> Result<Vec<MarketStateEvent>, ExecutionError> {
+fn day_dir_is_within_window(day_path: &Path, max_days: u64) -> bool {
+    if max_days == 0 {
+        return true;
+    }
+    let name = match day_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return true, // can't parse, include to be safe
+    };
+    let day = match chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return true, // non-date directory, include
+    };
+    let cutoff = (Utc::now() - chrono::Duration::days(max_days as i64)).date_naive();
+    day >= cutoff
+}
+
+fn load_market_state_events(root: &Path, max_days: u64) -> Result<Vec<MarketStateEvent>, ExecutionError> {
     let mut out = Vec::new();
     let dir = root.join("market_state");
     if !dir.exists() {
@@ -451,6 +475,9 @@ fn load_market_state_events(root: &Path) -> Result<Vec<MarketStateEvent>, Execut
         let day_dir = day_dir.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
         let day_path = day_dir.path();
         if !day_path.is_dir() {
+            continue;
+        }
+        if !day_dir_is_within_window(&day_path, max_days) {
             continue;
         }
         for file in fs::read_dir(day_path).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
@@ -475,7 +502,7 @@ fn load_market_state_events(root: &Path) -> Result<Vec<MarketStateEvent>, Execut
     Ok(out)
 }
 
-fn load_order_lifecycle_events(root: &Path) -> Result<Vec<OrderLifecycleEvent>, ExecutionError> {
+fn load_order_lifecycle_events(root: &Path, max_days: u64) -> Result<Vec<OrderLifecycleEvent>, ExecutionError> {
     let mut out = Vec::new();
     let dir = root.join("order_lifecycle");
     if !dir.exists() {
@@ -485,6 +512,9 @@ fn load_order_lifecycle_events(root: &Path) -> Result<Vec<OrderLifecycleEvent>, 
         let day_dir = day_dir.map_err(|e| ExecutionError::Exchange(e.to_string()))?;
         let day_path = day_dir.path();
         if !day_path.is_dir() {
+            continue;
+        }
+        if !day_dir_is_within_window(&day_path, max_days) {
             continue;
         }
         for file in fs::read_dir(day_path).map_err(|e| ExecutionError::Exchange(e.to_string()))? {
